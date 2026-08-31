@@ -634,23 +634,23 @@ fn resolve_identity_with_store(
     })
 }
 
-/// Recover from a corrupt nsec in the keyring (parse failed). Clear the bad
-/// keyring value, then migrate a valid leftover `identity.key` if one exists.
-/// If the migration marker is present but no valid file exists, the prior
-/// identity is unrecoverable — return `Lost` recovery rather than silently
-/// generating a new identity. Generating fresh is only correct when no prior
-/// identity ever existed (no marker). The keyring delete is best-effort: a
-/// delete failure logs and continues — it must never block startup.
+/// Recover from a corrupt nsec in the keyring (parse failed). Prefer a valid
+/// leftover `identity.key` first. Only clear the keyring entry once a
+/// replacement exists, or when there was never a prior identity (no migration
+/// marker). If the marker is present but no valid file exists, return `Lost`
+/// and leave the corrupt keyring value in place for support / manual export.
 fn recover_from_keyring(
     store: &impl IdentityKeyStore,
     legacy_path: &std::path::Path,
     data_dir: &std::path::Path,
     error: &str,
 ) -> Result<ResolvedIdentity, String> {
-    eprintln!("buzz-desktop: corrupt nsec in keyring ({error}), clearing and recovering from file");
-    if let Err(e) = store.delete(IDENTITY_KEY_NAME) {
-        eprintln!("buzz-desktop: failed to clear corrupt keyring value: {e}");
-    }
+    eprintln!(
+        "buzz-desktop: corrupt nsec in keyring ({error}), looking for a recovery path before clearing"
+    );
+    // Never delete the keyring entry until a replacement exists. Steady-state
+    // installs are marker-only: clearing first would destroy the only copy of
+    // the identity even when the parse failure is transient or tool-side.
     if legacy_path.exists() {
         if let Some(keys) = migrate_identity_file(store, legacy_path, data_dir)? {
             return Ok(ResolvedIdentity {
@@ -661,13 +661,13 @@ fn recover_from_keyring(
         }
     }
     // No valid file to recover from. If the migration marker exists, a prior
-    // identity was stored in the keyring and is now corrupt AND gone — the key
-    // is unrecoverable. Enter Lost recovery instead of silently rotating.
+    // identity was stored in the keyring — keep the corrupt entry for support /
+    // manual export and enter Lost rather than silently rotating.
     if migration_marker_path(data_dir).exists() {
         let ephemeral = Keys::generate();
         eprintln!(
-            "buzz-desktop: identity lost — keyring had corrupt data and no valid identity.key \
-             backup; prior identity (migration marker present) is unrecoverable; \
+            "buzz-desktop: identity lost — keyring value failed to parse and no valid identity.key \
+             backup exists; leaving the keyring entry in place; \
              using ephemeral key {}, awaiting user re-import",
             ephemeral.public_key().to_hex()
         );
@@ -677,7 +677,11 @@ fn recover_from_keyring(
             storage: IdentityStorage::Ephemeral,
         });
     }
-    // No marker: genuine first launch with a corrupt keyring. Generate fresh.
+    // No marker: genuine first launch with a corrupt keyring. Safe to clear and
+    // generate fresh — there was never a durable identity to protect.
+    if let Err(e) = store.delete(IDENTITY_KEY_NAME) {
+        eprintln!("buzz-desktop: failed to clear corrupt keyring value: {e}");
+    }
     let (keys, storage) = generate_and_persist(store, legacy_path, data_dir)?;
     Ok(ResolvedIdentity {
         keys,
@@ -686,8 +690,6 @@ fn recover_from_keyring(
     })
 }
 
-/// Load the `0o600` identity file, quarantining corruption, else generate and
-/// save a fresh key to the file. Used when no keyring is available.
 fn load_file_or_generate(
     legacy_path: &std::path::Path,
     data_dir: &std::path::Path,
