@@ -121,7 +121,11 @@ export function ChannelCanvas({
     );
   }
 
-  if (canvasQuery.error instanceof Error) {
+  // An initial load failure with no cached data: surface the full error state.
+  // A failed background refetch (data is defined, error is also set) must not
+  // replace the cached canvas and accepted-write notice — show a non-destructive
+  // refresh warning inline instead.
+  if (canvasQuery.error instanceof Error && canvasQuery.data === undefined) {
     return (
       <p
         className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
@@ -185,6 +189,18 @@ export function ChannelCanvas({
 
   return (
     <div className="space-y-3">
+      {canvasQuery.error instanceof Error ? (
+        <p
+          aria-live="polite"
+          className="rounded-xl border border-border/70 bg-muted/20 px-3 py-2 text-sm text-muted-foreground"
+          data-testid="channel-canvas-refresh-error"
+          role="status"
+        >
+          {isRelayUnreachableError(canvasQuery.error)
+            ? RELAY_UNREACHABLE_SHORT
+            : "Couldn't refresh canvas — showing last known content."}
+        </p>
+      ) : null}
       {unverifiedSaveNotice ? (
         <p
           aria-live="polite"

@@ -129,7 +129,11 @@ export function CanvasHistoryPanel({
     );
   }
 
-  if (historyQuery.error instanceof Error) {
+  // An initial load failure with no cached data: surface the full error state.
+  // A failed background refetch (data is defined, error is also set) must not
+  // unmount the history panel or clear the restore notice — show a non-destructive
+  // refresh warning inside the list view instead.
+  if (historyQuery.error instanceof Error && historyQuery.data === undefined) {
     return (
       <p
         className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
@@ -152,6 +156,18 @@ export function CanvasHistoryPanel({
 
   return (
     <div className="space-y-2" data-testid="channel-canvas-history">
+      {historyQuery.error instanceof Error ? (
+        <p
+          aria-live="polite"
+          className="rounded-xl border border-border/70 bg-muted/20 px-3 py-2 text-sm text-muted-foreground"
+          data-testid="channel-canvas-history-refresh-error"
+          role="status"
+        >
+          {isRelayUnreachableError(historyQuery.error)
+            ? RELAY_UNREACHABLE_SHORT
+            : "Couldn't refresh history — showing last known revisions."}
+        </p>
+      ) : null}
       {unverifiedRestoreNotice ? (
         <p
           aria-live="polite"
