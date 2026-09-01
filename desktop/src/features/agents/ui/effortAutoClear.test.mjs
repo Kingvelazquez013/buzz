@@ -111,21 +111,19 @@ dom.window.__TAURI_INTERNALS__ = globalThis.__TAURI_INTERNALS__;
 
 // ── Deferred imports ──────────────────────────────────────────────────────────
 
-let act, render, screen, cleanup, fireEvent;
+let act, render, screen, cleanup;
 let AgentConfigFields;
 let fromRawAcpRuntimeCatalogEntry;
-let createElement, useState, useCallback, useRef;
+let createElement, useState, useCallback;
 let setGlobalAgentConfig;
 
 before(async () => {
-  ({ act, render, screen, cleanup, fireEvent } = await import(
-    "@testing-library/react"
-  ));
+  ({ act, render, screen, cleanup } = await import("@testing-library/react"));
   ({ AgentConfigFields } = await import("./AgentConfigFields.tsx"));
   ({ fromRawAcpRuntimeCatalogEntry } = await import(
     "../../../shared/api/tauri.ts"
   ));
-  ({ createElement, useState, useCallback, useRef } = await import("react"));
+  ({ createElement, useState, useCallback } = await import("react"));
   ({ setGlobalAgentConfig } = await import(
     "../../../shared/api/tauriGlobalAgentConfig.ts"
   ));
