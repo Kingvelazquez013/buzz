@@ -502,3 +502,60 @@ test("latest locked state permits removal after denial, including a retained tog
   );
   assert.deepEqual(mention.knownNames, []);
 });
+
+test("retained team cannot bind a removed exact member", async () => {
+  await setup({ visible: true, directoryVisible: true });
+  const persona = {
+    id: "review-scout",
+    displayName: "Remote Scout",
+    isActive: true,
+  };
+  const team = {
+    id: "team-review",
+    name: "Review Team",
+    isBuiltin: false,
+    personaIds: [persona.id],
+  };
+  await act(async () => {
+    client.setQueryData(["personas"], [persona]);
+    client.setQueryData(
+      ["managed-agents"],
+      [
+        {
+          pubkey: AGENT,
+          name: "Remote Scout",
+          personaId: persona.id,
+          status: "running",
+        },
+      ],
+    );
+    client.setQueryData(["teams"], [team]);
+  });
+  await settle();
+  const row = mention.suggestions.find((s) => s.kind === "team");
+  assert.ok(row, JSON.stringify(mention.suggestions));
+  assert.equal(row.teamMembers[0].pubkey, AGENT);
+  const old = mention.insertMention;
+  state.missingDirectory = true;
+  await act(async () => client.setQueryData(["managed-agents"], []));
+  await act(async () =>
+    client.invalidateQueries({ queryKey: ["relay-agents"] }),
+  );
+  await settle();
+  assert.equal(
+    mention.suggestions.some((s) => s.pubkey === AGENT),
+    false,
+  );
+  assert.ok(mention.suggestions.find((s) => s.kind === "team"));
+  let edit;
+  await act(async () => {
+    edit = old(row, 1);
+  });
+  assert.deepEqual(mention.knownNames, []);
+  assert.deepEqual(mention.getDraftMentionRefs(edit.insertText), []);
+  assert.equal(
+    edit.insertText,
+    "",
+    "removed exact team member must not establish intent",
+  );
+});

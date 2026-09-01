@@ -475,6 +475,27 @@ export function useMentions(
       return (
         admissionRef.current.scope === admissionScope &&
         !!current &&
+        (current.kind !== "team" ||
+          (suggestion.kind === "team" &&
+            !!suggestion.teamMembers?.length &&
+            suggestion.teamMembers.length === current.teamMembers?.length &&
+            suggestion.teamMembers.every((member) => {
+              const matches = (target: {
+                pubkey?: string;
+                personaId?: string | null;
+              }) =>
+                member.pubkey
+                  ? target.pubkey === normalizePubkey(member.pubkey)
+                  : !!member.personaId &&
+                    !target.pubkey &&
+                    target.personaId === member.personaId;
+              return (
+                current.teamMembers?.some(matches) &&
+                admissionRef.current.candidates.some(
+                  (target) => matches(target) && isMentionActionable(target),
+                )
+              );
+            }))) &&
         isMentionActionable(current) &&
         isMentionActionable(suggestion)
       );
