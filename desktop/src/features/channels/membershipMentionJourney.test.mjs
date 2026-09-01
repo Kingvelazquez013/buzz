@@ -71,7 +71,9 @@ const rawAgent = () => ({
 const invoke = async (command, args) => {
   if (command.startsWith("plugin:event|")) return 0;
   if (command === "search_users") {
-    return { users: [], next_cursor: null };
+    state.searchCalls += 1;
+    if (state.failSearch) throw new Error("Search unavailable");
+    return { users: state.searchUsers, next_cursor: state.nextCursor };
   }
   if (command === "get_identity") return { pubkey: VIEWER };
   if (command === "create_channel") return channel();
@@ -219,6 +221,9 @@ async function setup(overrides = {}) {
   effects = [];
   state = {
     locked: [],
+    searchCalls: 0,
+    searchUsers: [],
+    nextCursor: null,
     channelId: CHANNEL,
     role: "bot",
     owner: VIEWER,
@@ -502,3 +507,123 @@ test("latest locked state permits removal after denial, including a retained tog
   );
   assert.deepEqual(mention.knownNames, []);
 });
+
+const keyboard = (key) => ({
+  key,
+  nativeEvent: {
+    key,
+    altKey: false,
+    ctrlKey: false,
+    metaKey: false,
+    shiftKey: false,
+    isComposing: false,
+  },
+  preventDefault() {},
+});
+for (const key of [" ", "Tab", "Enter"]) {
+  test(`fast ${JSON.stringify(key)} cannot bind before the current search discovers a collision`, async () => {
+    await setup({
+      owner: OTHER,
+      visible: true,
+      directoryVisible: true,
+      searchUsers: [
+        { pubkey: OTHER, display_name: "Remote Scout", is_agent: false },
+      ],
+    });
+    let outcome;
+    await act(async () => {
+      mention.updateMentionQuery("@Remote Scout", 13);
+      outcome = mention.handleMentionKeyDown(keyboard(key));
+      assert.equal(
+        state.searchCalls,
+        0,
+        "no current-query search at decision time",
+      );
+    });
+    assert.equal(outcome.suggestion, undefined);
+    assert.deepEqual(mention.knownNames, []);
+    await settle();
+    assert.equal(
+      mention.suggestions.filter((row) => row.displayName === "Remote Scout")
+        .length,
+      2,
+    );
+    assert.ok(mention.suggestions.every((row) => row.hasNameCollision));
+    await act(async () => {
+      outcome = mention.handleMentionKeyDown(keyboard("Tab"));
+    });
+    assert.equal(outcome.suggestion, undefined);
+    // A deliberate keyboard choice remains usable once the query has settled.
+    await act(async () => mention.handleMentionKeyDown(keyboard("ArrowDown")));
+    await act(async () => {
+      outcome = mention.handleMentionKeyDown(keyboard("Enter"));
+    });
+    assert.ok(outcome.suggestion?.pubkey);
+  });
+}
+
+for (const condition of ["failed", "paging", "fetching", "complete"]) {
+  test(`current ${condition} search gates implicit completion but not an explicit row choice`, async () => {
+    await setup({
+      owner: OTHER,
+      visible: true,
+      directoryVisible: true,
+      failSearch: condition === "failed",
+      nextCursor: condition === "paging" ? "more" : null,
+    });
+    await act(async () => mention.updateMentionQuery("@Remote Scout", 13));
+    await settle();
+    let release;
+    if (condition === "fetching") {
+      await act(async () => {
+        void client.fetchQuery({
+          queryKey: ["user-search", "infinite", "remote scout", 50],
+          queryFn: () =>
+            new Promise((resolve) => {
+              release = resolve;
+            }),
+        });
+      });
+    }
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    let outcome;
+    await act(async () => {
+      outcome = mention.handleMentionKeyDown(keyboard("Tab"));
+    });
+    assert.equal(Boolean(outcome.suggestion), condition === "complete");
+    if (condition !== "complete") {
+      await act(async () => {
+        outcome = mention.handleMentionKeyDown(keyboard(" "));
+      });
+      assert.equal(outcome.suggestion, undefined);
+      await act(async () =>
+        mention.handleMentionKeyDown(keyboard("ArrowDown")),
+      );
+      await act(async () => {
+        outcome = mention.handleMentionKeyDown(keyboard("Enter"));
+      });
+      assert.ok(
+        outcome.suggestion?.pubkey,
+        "deliberate keyboard choice bypasses completeness, not admission",
+      );
+    }
+    const row = rows()[0];
+    assert.equal(mention.canSelectMention(row), true);
+    await act(async () => picker.selectMentionSuggestion(row));
+    assert.ok(
+      effects.some(
+        ([effect, edit]) =>
+          effect === "edit" && edit.insertText.includes("@Remote Scout"),
+      ),
+    );
+    if (release)
+      await act(async () =>
+        release({
+          pages: [{ users: [], nextCursor: null }],
+          pageParams: [null],
+        }),
+      );
+  });
+}

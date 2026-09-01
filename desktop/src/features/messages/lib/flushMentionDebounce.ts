@@ -1,3 +1,4 @@
+import { isMentionActionable } from "./mentionPresentation";
 /**
  * Synchronously flush a pending mention debounce and resolve the correct
  * top-ranked suggestion. Used by handleMentionKeyDown to close the race
@@ -21,7 +22,8 @@ type MentionCandidateWithUI = MentionCandidateForRanking &
 
 export type FlushMentionDebounceResult =
   | { type: "match"; suggestion: MentionSuggestion; startIndex: number }
-  | { type: "no-match" };
+  | { type: "no-match" }
+  | { type: "needs-choice"; query: string; startIndex: number };
 
 export function isPlainSpace(
   event: Pick<
@@ -56,6 +58,7 @@ export function flushMentionDebounce<T extends MentionCandidateWithUI>(opts: {
   ownerProfiles?: UserProfileLookup;
   profiles?: UserProfileLookup;
   requireExact?: boolean;
+  resultsIncomplete?: boolean | ((normalizedQuery: string) => boolean);
 }): FlushMentionDebounceResult | null {
   if (opts.debounceTimerRef.current !== null) {
     clearTimeout(opts.debounceTimerRef.current);
@@ -95,6 +98,23 @@ export function flushMentionDebounce<T extends MentionCandidateWithUI>(opts: {
   }
 
   const { candidate, label } = exactMatch;
+  if (
+    (typeof opts.resultsIncomplete === "function"
+      ? opts.resultsIncomplete(normalizedQuery)
+      : opts.resultsIncomplete) ||
+    candidate.hasNameCollision ||
+    !isMentionActionable(candidate) ||
+    opts.candidates.filter(
+      (item) =>
+        item.displayName?.trim().toLowerCase() === label.trim().toLowerCase(),
+    ).length > 1
+  ) {
+    return {
+      type: "needs-choice",
+      query: mention.query,
+      startIndex: mention.startIndex,
+    };
+  }
   return {
     type: "match",
     suggestion: mapMentionCandidateToSuggestion({

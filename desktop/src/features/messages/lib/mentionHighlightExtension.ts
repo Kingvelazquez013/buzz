@@ -611,7 +611,7 @@ export function selectionAfterMentionTrailingSpace(
   // A multi-word name's internal spaces are not trailing separators.
   const lookbehind = Math.min(
     pos,
-    names.reduce((max, name) => Math.max(max, name.length + 2), 80),
+    names.reduce((max, name) => Math.max(max, name.length + 3), 80),
   );
   const before = doc.textBetween(pos - lookbehind, pos, "\n", "\0");
   const lower = before.toLowerCase();
@@ -645,13 +645,18 @@ export function selectionAfterMentionTrailingSpace(
   });
   if (internalSpace) return pos;
   const knownBoundary = names.some((name) => {
-    const start = before.length - name.length - 1;
-    return (
-      start >= 0 &&
-      (start === 0 || /[\s(]/.test(before[start - 1])) &&
-      (before[start] === "@" || before[start] === "#") &&
-      lower.slice(start + 1) === name.toLowerCase()
-    );
+    // Team expansion adds one closing parenthesis outside the literal label.
+    // Match it separately: refreshed registrations contain the exact member
+    // label, not the wrapper, including when the label itself ends in a key.
+    return [name.toLowerCase(), `${name.toLowerCase()})`].some((label) => {
+      const start = before.length - label.length - 1;
+      return (
+        start >= 0 &&
+        (start === 0 || /[\s(]/.test(before[start - 1])) &&
+        (before[start] === "@" || before[start] === "#") &&
+        lower.slice(start + 1) === label
+      );
+    });
   });
   if (!knownBoundary && !/(?:^|[\s(])[@#][^\s]+$/.test(before)) return pos;
   return pos + 1;

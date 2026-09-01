@@ -563,3 +563,22 @@ test("agents without trustworthy provenance omit management provenance", () => {
     false,
   );
 });
+
+test("keyboard selection follows an exact key through refresh and does not retarget on removal", async () => {
+  const { renderHook, act } = await import("@testing-library/react");
+  const { useMentionSelection } = await import("../lib/useMentionSelection.ts");
+  const a = { pubkey: "a", displayName: "Scout" },
+    b = { pubkey: "b", displayName: "Scout" };
+  const view = renderHook(({ rows }) => useMentionSelection(rows), {
+    initialProps: { rows: [a, b] },
+  });
+  act(() => view.result.current.setMentionSelectedIndex((index) => index + 1));
+  assert.equal(view.result.current.mentionSelectedIndex, 1);
+  assert.equal(view.result.current.hasDeliberateSelection, true);
+  view.rerender({ rows: [b, a] });
+  assert.equal(view.result.current.mentionSelectedIndex, 0);
+  view.rerender({ rows: [a] });
+  assert.equal(view.result.current.mentionSelectedIndex, -1);
+  act(() => view.result.current.clearAgentSelectionPreference());
+  assert.equal(view.result.current.hasDeliberateSelection, false);
+});

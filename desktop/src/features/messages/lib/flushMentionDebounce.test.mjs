@@ -185,7 +185,7 @@ test("flushMentionDebounce resolves the complete longer name", () => {
   assert.equal(flushed?.suggestion.displayName, "Beta Tester");
 });
 
-test("flushMentionDebounce prefers an exact channel member with a duplicate name", () => {
+test("flushMentionDebounce requires explicit choice even when one duplicate is a member", () => {
   const memberPubkey = "a".repeat(64);
   const flushed = flushMentionDebounce({
     debounceTimerRef: ref(null),
@@ -202,8 +202,8 @@ test("flushMentionDebounce prefers an exact channel member with a duplicate name
     requireExact: true,
   });
 
-  assert.equal(flushed?.type, "match");
-  assert.equal(flushed?.suggestion.pubkey, memberPubkey);
+  assert.equal(flushed?.type, "needs-choice");
+  assert.equal(flushed?.suggestion, undefined);
 });
 
 test("flushMentionDebounce preserves a team expansion selected with Enter", () => {

@@ -22,6 +22,7 @@ import { getPlatformKeysById } from "@/shared/lib/keyboard-shortcuts";
 
 export type MentionSuggestion = {
   action?: MentionAction;
+  hasNameCollision?: boolean;
   pubkey?: string;
   personaId?: string;
   teamId?: string;
@@ -332,6 +333,7 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
               (suggestion.teamId ? `team-${suggestion.teamId}` : null) ??
               suggestion.displayName;
             const hasNameCollision =
+              suggestion.hasNameCollision ||
               (nameCounts.get(suggestion.displayName.toLowerCase()) ?? 0) > 1;
             const showAgentProvenanceMarker = showMentionAgentProvenanceMarker(
               suggestion,
@@ -375,7 +377,7 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                 key={suggestionKey}
               >
                 <button
-                  aria-label={`Mention ${suggestion.displayName}`}
+                  aria-label={`Mention ${suggestion.displayName}${hasNameCollision && suggestion.pubkey ? ` (${suggestion.pubkey})` : ""}`}
                   className={cn(
                     "flex min-w-0 flex-1 items-center gap-2 rounded-lg px-3 py-1.5 text-left",
                     canAlwaysAddress && "pr-11",

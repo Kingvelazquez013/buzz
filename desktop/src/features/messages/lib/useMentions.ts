@@ -1,4 +1,7 @@
-import { isMentionActionable } from "./mentionPresentation";
+import {
+  isMentionActionable,
+  markMentionCollisions,
+} from "./mentionPresentation";
 import * as React from "react";
 import {
   useManagedAgentsQuery,
@@ -13,7 +16,6 @@ import {
 import { useIsArchivedPredicate } from "@/features/identity-archive/hooks";
 import type { MentionSuggestion } from "@/features/messages/ui/MentionAutocomplete";
 import {
-  filterCachedAgentSuggestions,
   getAgentIdentityPubkeys,
   getMentionableAgentPubkeys,
   getSharedChannelIds,
@@ -89,7 +91,6 @@ export function useMentions(
   selectedAgentMentionNamesRef.current = selectedAgentMentionNames;
   const mentionMapRef = React.useRef<Map<string, string>>(new Map());
   const personaMentionMapRef = React.useRef<Map<string, string>>(new Map());
-  const previousSuggestionsRef = React.useRef<MentionSuggestion[]>([]);
   const mentionSearchQuery = mentionQuery?.trim() ?? "";
   const canSearchGlobalPeople = mentionSearchQuery.length > 0;
   const identityQuery = useIdentityQuery();
@@ -296,14 +297,15 @@ export function useMentions(
     ],
   );
   const mentionCandidatesWithTeams = React.useMemo(
-    () => [
-      ...mentionCandidates,
-      ...buildTeamMentionCandidates(
-        teamsQuery.data ?? [],
-        personasQuery.data ?? [],
-        mentionCandidates,
-      ),
-    ],
+    () =>
+      markMentionCollisions([
+        ...mentionCandidates,
+        ...buildTeamMentionCandidates(
+          teamsQuery.data ?? [],
+          personasQuery.data ?? [],
+          mentionCandidates,
+        ),
+      ]),
     [mentionCandidates, personasQuery.data, teamsQuery.data],
   );
   const ownerPubkeys = React.useMemo(
@@ -420,30 +422,8 @@ export function useMentions(
     if (matchingSuggestions.length > 0) {
       return matchingSuggestions;
     }
-    if (userSearchQuery.isFetching) {
-      return filterCachedAgentSuggestions(
-        previousSuggestionsRef.current,
-        mentionCandidatesWithTeams,
-      );
-    }
     return [];
-  }, [
-    matchingSuggestions,
-    mentionCandidatesWithTeams,
-    mentionQuery,
-    userSearchQuery.isFetching,
-  ]);
-  React.useEffect(() => {
-    if (mentionQuery === null) {
-      previousSuggestionsRef.current = [];
-      return;
-    }
-    if (matchingSuggestions.length > 0) {
-      previousSuggestionsRef.current = matchingSuggestions;
-    } else if (!userSearchQuery.isFetching) {
-      previousSuggestionsRef.current = [];
-    }
-  }, [matchingSuggestions, mentionQuery, userSearchQuery.isFetching]);
+  }, [matchingSuggestions, mentionQuery]);
   const mentionSelection = useMentionSelection(suggestions);
   const { mentionSelectedIndex, setMentionSelectedIndex: setSelected } =
     mentionSelection;
@@ -836,7 +816,21 @@ export function useMentions(
             ownerProfiles: ownerProfilesQuery.data?.profiles,
             profiles,
             requireExact: exactMentionSpace,
+            resultsIncomplete: (query) =>
+              query !== mentionSearchQuery.toLowerCase() ||
+              !canSearchGlobalUsers ||
+              !userSearchQuery.isSuccess ||
+              Boolean(
+                userSearchQuery.hasNextPage || userSearchQuery.isFetching,
+              ),
           });
+          if (flushed?.type === "needs-choice") {
+            setMentionQuery(flushed.query);
+            setMentionStartIndex(flushed.startIndex);
+            if (exactMentionSpace) return { handled: false };
+            event.preventDefault();
+            return { handled: true };
+          }
           if (exactMentionSpace && flushed?.type !== "match")
             return { handled: false };
           event.preventDefault();
@@ -852,7 +846,18 @@ export function useMentions(
           }
         }
         event.preventDefault();
-        return { handled: true, suggestion: suggestions[mentionSelectedIndex] };
+        const chosen = suggestions[mentionSelectedIndex];
+        if (
+          !chosen ||
+          !isMentionActionable(chosen) ||
+          (!mentionSelection.hasDeliberateSelection &&
+            (chosen.hasNameCollision ||
+              userSearchQuery.hasNextPage ||
+              userSearchQuery.isFetching ||
+              (canSearchGlobalPeople && !userSearchQuery.isSuccess)))
+        )
+          return { handled: true };
+        return { handled: true, suggestion: chosen };
       }
       if (event.key === "Escape") {
         event.preventDefault();
@@ -869,6 +874,13 @@ export function useMentions(
       isMentionOpen,
       mentionCandidatesWithTeams,
       mentionSelectedIndex,
+      mentionSelection.hasDeliberateSelection,
+      userSearchQuery.hasNextPage,
+      userSearchQuery.isFetching,
+      userSearchQuery.isSuccess,
+      canSearchGlobalPeople,
+      canSearchGlobalUsers,
+      mentionSearchQuery,
       options?.channelType,
       ownerProfilesQuery.data?.profiles,
       profiles,

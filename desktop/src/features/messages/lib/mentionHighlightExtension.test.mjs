@@ -563,3 +563,63 @@ test("full-name boundaries preserve internal spaces and intentional caret moves"
     1 + "@Scout (ed12) ".length,
   );
 });
+
+test("team separator survives qualified-label refresh and immediate typing", () => {
+  // Long enough that the boundary scan must include the wrapper and delimiter.
+  const label = `Remote Scout (${"b".repeat(64)})`;
+  const names = ["Remote Scout", label];
+  const inserted = `Scouts(@Remote Scout @${label}) `;
+  const edge = inserted.length;
+  const storage = { names: [], agentNames: [], channelNames: [] };
+  const plugins = MentionHighlightExtension.config.addProseMirrorPlugins.call({
+    storage,
+  });
+  const state = EditorState.create({
+    doc: document(paragraph(text("@Scouts"))),
+    schema,
+    plugins,
+  });
+  const tr = state.tr.insertText(inserted, 1, 8);
+  tr.setSelection(TextSelection.create(tr.doc, edge + 1));
+  settleAutocompleteMentionInsert(
+    { storage: { mentionHighlight: storage } },
+    tr,
+    inserted,
+  );
+  const picked = state.apply(tr);
+  assignMentionHighlightNames(storage, names, [], []);
+  const refreshed = picked.apply(picked.tr.setMeta(mentionHighlightKey, true));
+  assert.equal(
+    selectionAfterMentionTrailingSpace(refreshed.doc, edge, names),
+    edge + 1,
+  );
+  assert.deepEqual(
+    insertionForMentionTextInput(refreshed.doc, edge, edge + 1, " h", names),
+    { insertAt: edge + 1, text: "h" },
+  );
+  const typed = textInput(refreshed, edge, edge + 1, "\u00a0h");
+  assert.equal(
+    typeAt(typed, typed.selection.from, "ello").doc.textContent,
+    `${inserted}hello`,
+  );
+  assert.equal(
+    mentionTextInputInsertion(refreshed.doc, edge, edge, "h", false, names),
+    null,
+  );
+  // Wrapper recognition must not consume internal label spaces or arbitrary suffixes.
+  for (const suffix of ["", ")", "))", "x)"]) {
+    const doc = document(
+      paragraph(text(`Scouts(@Remote Scout @${label}${suffix} `)),
+    );
+    const pos = doc.textContent.length;
+    assert.equal(
+      selectionAfterMentionTrailingSpace(doc, pos, names),
+      pos + Number(suffix === "" || suffix === ")"),
+    );
+    const internal = 1 + doc.textContent.lastIndexOf(" (");
+    assert.equal(
+      selectionAfterMentionTrailingSpace(doc, internal, names),
+      internal,
+    );
+  }
+});
