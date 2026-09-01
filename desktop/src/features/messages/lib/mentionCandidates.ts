@@ -1,3 +1,4 @@
+import type { MentionAction } from "./mentionPresentation";
 import { resolveTeamPersonas } from "@/features/agents/lib/teamPersonas";
 import type {
   AgentPersona,
@@ -33,6 +34,7 @@ export type TeamMentionMember = {
 };
 
 export type MentionCandidate = {
+  action?: MentionAction;
   kind: "identity" | "persona" | "team";
   pubkey?: string;
   personaId?: string;
