@@ -668,7 +668,13 @@ impl Db {
         };
         let aurora_identity = self.reader_aurora_identity.clone();
         tokio::spawn(async move {
-            match observability::acquire(&read_pool, observability::PoolRole::Reader).await {
+            match observability::acquire(
+                &read_pool,
+                observability::PoolRole::Reader,
+                observability::DbOperation::Maintenance,
+            )
+            .await
+            {
                 Ok(mut conn) => {
                     tracing::info!("read replica reachable at boot");
                     match replica_fence::reader_supports_aurora_identity(&mut conn).await {
@@ -797,6 +803,7 @@ impl Db {
     async fn proved_reader(
         &self,
         read_pool: &PgPool,
+        operation: observability::DbOperation,
     ) -> std::result::Result<
         (
             sqlx::Transaction<'static, sqlx::Postgres>,
@@ -810,7 +817,13 @@ impl Db {
         // `read_pool` separately would spend a second budget whenever the
         // capability is uncached — i.e. after a failed boot ping, which is
         // precisely the reader-unavailable case the bound must hold for.
-        let conn = match observability::acquire(read_pool, observability::PoolRole::Reader).await {
+        let conn = match observability::acquire(
+            read_pool,
+            observability::PoolRole::Reader,
+            operation,
+        )
+        .await
+        {
             Ok(conn) => conn,
             Err(sqlx::Error::PoolTimedOut) => {
                 tracing::warn!("reader pool acquire timed out; routing to writer");
@@ -933,7 +946,19 @@ impl Db {
 
     /// Returns `true` if the database is reachable (used by readiness probes).
     pub async fn ping(&self) -> bool {
-        sqlx::query("SELECT 1").execute(&self.pool).await.is_ok()
+        let Ok(mut connection) = observability::acquire(
+            &self.pool,
+            observability::PoolRole::Writer,
+            observability::DbOperation::Readiness,
+        )
+        .await
+        else {
+            return false;
+        };
+        sqlx::query("SELECT 1")
+            .execute(&mut *connection)
+            .await
+            .is_ok()
     }
 
     /// Returns pool utilisation stats for metrics emission.
@@ -970,8 +995,12 @@ impl Db {
     /// Returns a `'static` transaction because `PgPool` is `Arc`-backed internally.
     /// The transaction holds an owned pool handle, not a borrow.
     pub async fn begin_transaction(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
-        let connection =
-            observability::acquire(&self.pool, observability::PoolRole::Writer).await?;
+        let connection = observability::acquire(
+            &self.pool,
+            observability::PoolRole::Writer,
+            observability::DbOperation::Other,
+        )
+        .await?;
         sqlx::Transaction::begin(connection, None)
             .await
             .map_err(Into::into)
@@ -999,7 +1028,13 @@ impl Db {
             return Err(DbError::EphemeralEventRejected(kind_u16));
         }
 
-        let mut tx = self.pool.begin().await?;
+        let connection = observability::acquire(
+            &self.pool,
+            observability::PoolRole::Writer,
+            observability::DbOperation::EventWrite,
+        )
+        .await?;
+        let mut tx = sqlx::Transaction::begin(connection, None).await?;
         self.deletion_store()
             .guard_transaction_with_serving_lease(&mut tx, lease)
             .await?;
@@ -1027,6 +1062,7 @@ impl Db {
         &self,
         path: &'static str,
         predicate: RoutePredicate,
+        operation: observability::DbOperation,
     ) -> RouteDecision {
         let Some(read_pool) = &self.read_pool else {
             Self::record_route(path, "writer", "disabled");
@@ -1069,7 +1105,7 @@ impl Db {
             Self::record_route(path, "writer", reason);
             return RouteDecision::Writer;
         }
-        match self.proved_reader(read_pool).await {
+        match self.proved_reader(read_pool, operation).await {
             Ok((tx, entry)) => {
                 // Re-evaluate against the entry the session actually proved
                 // (it may be older than the shared newest).

@@ -91,6 +91,12 @@ impl Db {
         &self,
         normalized_host: &str,
     ) -> Result<Option<CommunityRecord>> {
+        let mut connection = crate::observability::acquire(
+            &self.pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::DbOperation::CommunityLookup,
+        )
+        .await?;
         let row = sqlx::query(
             r#"
             SELECT id, host
@@ -102,7 +108,7 @@ impl Db {
             "#,
         )
         .bind(normalized_host)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *connection)
         .await?;
 
         row.map(|row| {

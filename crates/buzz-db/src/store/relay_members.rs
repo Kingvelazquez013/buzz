@@ -32,7 +32,12 @@ pub struct RelayMember {
 
 /// Returns `true` if `pubkey` (64-char hex) is a member of `community`.
 pub async fn is_relay_member(pool: &PgPool, community: CommunityId, pubkey: &str) -> Result<bool> {
-    let mut conn = pool.acquire().await?;
+    let mut conn = observability::acquire(
+        pool,
+        observability::PoolRole::Writer,
+        observability::DbOperation::Authentication,
+    )
+    .await?;
     is_relay_member_on(&mut conn, community, pubkey).await
 }
 
@@ -57,12 +62,18 @@ pub(crate) async fn is_relay_member_on(
 /// (`bootstrap_owner`) and operator provisioning still populate it — this is
 /// how the workspace-profile gate detects whether a steward exists.
 pub async fn has_admin_or_owner(pool: &PgPool, community: CommunityId) -> Result<bool> {
+    let mut connection = observability::acquire(
+        pool,
+        observability::PoolRole::Writer,
+        observability::DbOperation::Authentication,
+    )
+    .await?;
     let row = sqlx::query(
         "SELECT 1 FROM relay_members \
          WHERE community_id = $1 AND role IN ('admin', 'owner') LIMIT 1",
     )
     .bind(community.as_uuid())
-    .fetch_optional(pool)
+    .fetch_optional(&mut *connection)
     .await?;
     Ok(row.is_some())
 }
@@ -73,13 +84,19 @@ pub async fn get_relay_member(
     community: CommunityId,
     pubkey: &str,
 ) -> Result<Option<RelayMember>> {
+    let mut connection = observability::acquire(
+        pool,
+        observability::PoolRole::Writer,
+        observability::DbOperation::Authentication,
+    )
+    .await?;
     let row = sqlx::query(
         "SELECT pubkey, role, added_by, created_at, updated_at \
          FROM relay_members WHERE community_id = $1 AND pubkey = $2",
     )
     .bind(community.as_uuid())
     .bind(pubkey)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *connection)
     .await?;
 
     row.map(|r| -> std::result::Result<RelayMember, sqlx::Error> {
@@ -624,7 +641,14 @@ impl Db {
     #[datastore_span(name = "is_relay_member", system = "postgresql")]
     pub async fn is_relay_member(&self, community: CommunityId, pubkey: &str) -> Result<bool> {
         let path = "relay_membership";
-        match self.route_read(path, RoutePredicate::Bounded).await {
+        match self
+            .route_read(
+                path,
+                RoutePredicate::Bounded,
+                crate::observability::DbOperation::Authentication,
+            )
+            .await
+        {
             RouteDecision::Replica(mut tx, _entry, reason) => {
                 match is_relay_member_on(&mut tx, community, pubkey).await {
                     Ok(is_member) => {

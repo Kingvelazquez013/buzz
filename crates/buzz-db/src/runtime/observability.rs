@@ -24,6 +24,48 @@ impl PoolRole {
     }
 }
 
+/// Bounded operation families that can wait for a database connection.
+///
+/// These labels intentionally describe operator-relevant traffic classes,
+/// rather than individual functions or request paths. That keeps the series
+/// small while still showing whether pool pressure is blocking startup,
+/// authentication, history reads, or writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DbOperation {
+    Readiness,
+    CommunityLookup,
+    Authentication,
+    SubscriptionHistory,
+    EventWrite,
+    Maintenance,
+    Other,
+}
+
+impl DbOperation {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 7] = [
+        Self::Readiness,
+        Self::CommunityLookup,
+        Self::Authentication,
+        Self::SubscriptionHistory,
+        Self::EventWrite,
+        Self::Maintenance,
+        Self::Other,
+    ];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Readiness => "readiness",
+            Self::CommunityLookup => "community_lookup",
+            Self::Authentication => "authentication",
+            Self::SubscriptionHistory => "subscription_history",
+            Self::EventWrite => "event_write",
+            Self::Maintenance => "maintenance",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LockType {
     Replacement,
@@ -115,9 +157,28 @@ impl TransactionOperation {
             Self::FenceCommunityDeletion => "fence_community_deletion",
         }
     }
+
+    const fn db_operation(self) -> DbOperation {
+        match self {
+            Self::ReplaceParameterizedEvent
+            | Self::ReplaceAddressableEvent
+            | Self::PublishNip43MembershipLocked
+            | Self::AcceptPushLeaseEvent => DbOperation::EventWrite,
+            Self::BeginCommunityDeletionQuiescing | Self::FenceCommunityDeletion => {
+                DbOperation::Maintenance
+            }
+        }
+    }
 }
 
-pub(crate) fn record_pool_acquire(role: PoolRole, outcome: Outcome, elapsed: Duration) {
+pub(crate) fn record_pool_acquire(
+    role: PoolRole,
+    operation: DbOperation,
+    outcome: Outcome,
+    elapsed: Duration,
+) {
+    // Keep the original two metrics stable for existing dashboards while the
+    // operation-aware series are rolled out and validated in staging.
     metrics::histogram!(
         "buzz_db_pool_acquire_wait_seconds",
         "pool_role" => role.as_str(),
@@ -130,19 +191,60 @@ pub(crate) fn record_pool_acquire(role: PoolRole, outcome: Outcome, elapsed: Dur
         "outcome" => outcome.as_str(),
     )
     .increment(1);
+
+    metrics::histogram!(
+        "buzz_db_pool_acquire_duration_seconds",
+        "pool" => role.as_str(),
+        "operation" => operation.as_str(),
+        "result" => outcome.as_str(),
+    )
+    .record(elapsed.as_secs_f64());
+
+    if outcome == Outcome::Timeout {
+        metrics::counter!(
+            "buzz_db_pool_acquire_timeouts_total",
+            "pool" => role.as_str(),
+            "operation" => operation.as_str(),
+        )
+        .increment(1);
+    }
+}
+
+/// Tracks an in-flight checkout until it succeeds, fails, or is cancelled.
+///
+/// The decrement lives in `Drop`, so aborting the acquisition future cannot
+/// leave the waiter gauge permanently elevated.
+struct PoolWaiter {
+    role: PoolRole,
+}
+
+impl PoolWaiter {
+    fn start(role: PoolRole) -> Self {
+        metrics::gauge!("buzz_db_pool_waiters", "pool" => role.as_str()).increment(1.0);
+        Self { role }
+    }
+}
+
+impl Drop for PoolWaiter {
+    fn drop(&mut self) {
+        metrics::gauge!("buzz_db_pool_waiters", "pool" => self.role.as_str()).decrement(1.0);
+    }
 }
 
 pub(crate) async fn acquire(
     pool: &sqlx::PgPool,
     role: PoolRole,
+    operation: DbOperation,
 ) -> sqlx::Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {
+    let waiter = PoolWaiter::start(role);
     let started = Instant::now();
     let result = pool.acquire().await;
+    drop(waiter);
     let outcome = result
         .as_ref()
         .map(|_| Outcome::Success)
         .unwrap_or_else(Outcome::from_sqlx_error);
-    record_pool_acquire(role, outcome, started.elapsed());
+    record_pool_acquire(role, operation, outcome, started.elapsed());
     result
 }
 
@@ -150,7 +252,7 @@ pub(crate) async fn begin_transaction(
     pool: &sqlx::PgPool,
     operation: TransactionOperation,
 ) -> sqlx::Result<(sqlx::Transaction<'static, sqlx::Postgres>, TransactionTimer)> {
-    let connection = acquire(pool, PoolRole::Writer).await?;
+    let connection = acquire(pool, PoolRole::Writer, operation.db_operation()).await?;
     let transaction = sqlx::Transaction::begin(connection, None).await?;
     Ok((transaction, TransactionTimer::start(operation)))
 }
@@ -221,8 +323,8 @@ impl Drop for TransactionTimer {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire, observe_advisory_lock, record_pool_acquire, LockType, Outcome, PoolRole,
-        TransactionOperation, TransactionTimer,
+        acquire, observe_advisory_lock, record_pool_acquire, DbOperation, LockType, Outcome,
+        PoolRole, PoolWaiter, TransactionOperation, TransactionTimer,
     };
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::collections::{BTreeMap, BTreeSet};
@@ -231,6 +333,18 @@ mod tests {
     #[test]
     fn label_vocabularies_are_closed_and_documented() {
         assert_eq!(PoolRole::ALL.map(PoolRole::as_str), ["writer", "reader"]);
+        assert_eq!(
+            DbOperation::ALL.map(DbOperation::as_str),
+            [
+                "readiness",
+                "community_lookup",
+                "authentication",
+                "subscription_history",
+                "event_write",
+                "maintenance",
+                "other",
+            ]
+        );
         assert_eq!(
             LockType::ALL.map(LockType::as_str),
             [
@@ -312,11 +426,13 @@ mod tests {
 
         record_pool_acquire(
             PoolRole::Writer,
+            DbOperation::Readiness,
             Outcome::Success,
             Duration::from_millis(12),
         );
         record_pool_acquire(
             PoolRole::Reader,
+            DbOperation::SubscriptionHistory,
             Outcome::Timeout,
             Duration::from_millis(34),
         );
@@ -411,6 +527,43 @@ mod tests {
             );
         }
 
+        for (name, labels) in [
+            (
+                "buzz_db_pool_acquire_duration_seconds",
+                [
+                    ("operation", "readiness"),
+                    ("pool", "writer"),
+                    ("result", "success"),
+                ],
+            ),
+            (
+                "buzz_db_pool_acquire_duration_seconds",
+                [
+                    ("operation", "subscription_history"),
+                    ("pool", "reader"),
+                    ("result", "timeout"),
+                ],
+            ),
+        ] {
+            let labels = labels
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect();
+            assert!(
+                keys.contains(&(name.to_owned(), labels)),
+                "missing operation-aware pool duration for {name}"
+            );
+        }
+        assert!(keys.contains(&(
+            "buzz_db_pool_acquire_timeouts_total".to_owned(),
+            [
+                ("operation".to_owned(), "subscription_history".to_owned()),
+                ("pool".to_owned(), "reader".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+        )));
+
         for (key, _, _, value) in snapshot {
             if key.key().name().ends_with("_seconds") {
                 let DebugValue::Histogram(samples) = value else {
@@ -424,6 +577,43 @@ mod tests {
                 assert_eq!(value, 1);
             }
         }
+    }
+
+    #[test]
+    fn waiter_guard_balances_gauge_increment_with_drop_decrement() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let waiter = PoolWaiter::start(PoolRole::Writer);
+        let active = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(key, _, _, value)| {
+                (key.key().name() == "buzz_db_pool_waiters").then_some(value)
+            })
+            .expect("writer waiter gauge");
+        let DebugValue::Gauge(active) = active else {
+            panic!("pool waiters must be a gauge");
+        };
+        assert_eq!(active.into_inner(), 1.0);
+
+        drop(waiter);
+        let settled = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(key, _, _, value)| {
+                (key.key().name() == "buzz_db_pool_waiters").then_some(value)
+            })
+            .expect("settled writer waiter gauge");
+        let DebugValue::Gauge(settled) = settled else {
+            panic!("pool waiters must be a gauge");
+        };
+        // DebuggingRecorder snapshots gauge deltas, so the second snapshot
+        // observes the balancing decrement rather than the accumulated zero.
+        assert_eq!(settled.into_inner(), -1.0);
     }
 
     async fn pool_acquire_records_success_timeout_and_error_with_wait_time() {
@@ -442,16 +632,16 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         let _guard = metrics::set_default_local_recorder(&recorder);
 
-        let held = acquire(&pool, PoolRole::Writer)
+        let held = acquire(&pool, PoolRole::Writer, DbOperation::EventWrite)
             .await
             .expect("writer acquire succeeds");
-        let timeout = acquire(&pool, PoolRole::Reader)
+        let timeout = acquire(&pool, PoolRole::Reader, DbOperation::SubscriptionHistory)
             .await
             .expect_err("reader-labeled checkout times out while pool is saturated");
         assert!(matches!(timeout, sqlx::Error::PoolTimedOut));
         drop(held);
         pool.close().await;
-        let closed = acquire(&pool, PoolRole::Writer)
+        let closed = acquire(&pool, PoolRole::Writer, DbOperation::Readiness)
             .await
             .expect_err("closed pool acquire errors");
         assert!(matches!(closed, sqlx::Error::PoolClosed));

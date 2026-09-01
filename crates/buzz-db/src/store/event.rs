@@ -274,7 +274,12 @@ pub async fn insert_event(
     event: &Event,
     channel_id: Option<Uuid>,
 ) -> Result<(StoredEvent, bool)> {
-    let mut connection = pool.acquire().await?;
+    let mut connection = crate::observability::acquire(
+        pool,
+        crate::observability::PoolRole::Writer,
+        crate::observability::DbOperation::EventWrite,
+    )
+    .await?;
     insert_event_on(&mut connection, community_id, event, channel_id).await
 }
 
@@ -355,7 +360,12 @@ async fn insert_event_on(
 /// Uses `QueryBuilder` for dynamic filter composition — avoids string concatenation
 /// while keeping all user values in bind parameters.
 pub async fn query_events(pool: &PgPool, q: &EventQuery) -> Result<Vec<StoredEvent>> {
-    let mut conn = pool.acquire().await?;
+    let mut conn = crate::observability::acquire(
+        pool,
+        crate::observability::PoolRole::Writer,
+        crate::observability::DbOperation::SubscriptionHistory,
+    )
+    .await?;
     query_events_on(&mut conn, q).await
 }
 
@@ -659,7 +669,12 @@ pub(crate) fn row_to_stored_event(row: sqlx::postgres::PgRow) -> Result<Option<S
 ///
 /// Uses the same filter logic as `query_events` but returns only the count.
 pub async fn count_events(pool: &PgPool, q: &EventQuery) -> Result<i64> {
-    let mut conn = pool.acquire().await?;
+    let mut conn = crate::observability::acquire(
+        pool,
+        crate::observability::PoolRole::Writer,
+        crate::observability::DbOperation::SubscriptionHistory,
+    )
+    .await?;
     count_events_on(&mut conn, q).await
 }
 
@@ -1094,7 +1109,12 @@ pub async fn get_events_by_ids(
     if ids.is_empty() {
         return Ok(vec![]);
     }
-    let mut conn = pool.acquire().await?;
+    let mut conn = crate::observability::acquire(
+        pool,
+        crate::observability::PoolRole::Writer,
+        crate::observability::DbOperation::SubscriptionHistory,
+    )
+    .await?;
     get_events_by_ids_on(&mut conn, community_id, ids).await
 }
 
@@ -1340,7 +1360,13 @@ pub async fn insert_event_with_thread_metadata(
     channel_id: Option<Uuid>,
     thread_meta: Option<ThreadMetadataParams<'_>>,
 ) -> Result<(StoredEvent, bool)> {
-    let mut tx = pool.begin().await?;
+    let connection = crate::observability::acquire(
+        pool,
+        crate::observability::PoolRole::Writer,
+        crate::observability::DbOperation::EventWrite,
+    )
+    .await?;
+    let mut tx = sqlx::Transaction::begin(connection, None).await?;
     let result =
         insert_event_with_thread_metadata_tx(&mut tx, community_id, event, channel_id, thread_meta)
             .await?;
@@ -1404,7 +1430,14 @@ impl Db {
         q: &EventQuery,
     ) -> Result<Vec<StoredEvent>> {
         let predicate = crate::RoutePredicate::for_query(q, self.replica_read_max_age.is_some());
-        match self.route_read(path, predicate).await {
+        match self
+            .route_read(
+                path,
+                predicate,
+                crate::observability::DbOperation::SubscriptionHistory,
+            )
+            .await
+        {
             crate::RouteDecision::Replica(mut tx, _entry, reason) => {
                 match crate::event::query_events_on(&mut tx, q).await {
                     Ok(events) => {
@@ -1438,7 +1471,14 @@ impl Db {
         path: &'static str,
         q: &EventQuery,
     ) -> Result<Vec<StoredEvent>> {
-        match self.route_read(path, crate::RoutePredicate::Bounded).await {
+        match self
+            .route_read(
+                path,
+                crate::RoutePredicate::Bounded,
+                crate::observability::DbOperation::SubscriptionHistory,
+            )
+            .await
+        {
             crate::RouteDecision::Replica(mut tx, _entry, reason) => {
                 match crate::event::query_events_on(&mut tx, q).await {
                     Ok(events) => {
@@ -1477,7 +1517,14 @@ impl Db {
     /// the error to the accepted budget `B`.
     #[datastore_span(name = "count_events_routed", system = "postgresql")]
     pub async fn count_events_routed(&self, path: &'static str, q: &EventQuery) -> Result<i64> {
-        match self.route_read(path, crate::RoutePredicate::Bounded).await {
+        match self
+            .route_read(
+                path,
+                crate::RoutePredicate::Bounded,
+                crate::observability::DbOperation::SubscriptionHistory,
+            )
+            .await
+        {
             crate::RouteDecision::Replica(mut tx, _entry, reason) => {
                 match crate::event::count_events_on(&mut tx, q).await {
                     Ok(count) => {
@@ -1650,7 +1697,14 @@ impl Db {
         community_id: CommunityId,
         ids: &[&[u8]],
     ) -> Result<Vec<StoredEvent>> {
-        match self.route_read(path, crate::RoutePredicate::Bounded).await {
+        match self
+            .route_read(
+                path,
+                crate::RoutePredicate::Bounded,
+                crate::observability::DbOperation::SubscriptionHistory,
+            )
+            .await
+        {
             crate::RouteDecision::Replica(mut tx, _entry, reason) => {
                 match crate::event::get_events_by_ids_on(&mut tx, community_id, ids).await {
                     Ok(events) => {

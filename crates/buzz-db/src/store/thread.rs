@@ -355,7 +355,12 @@ pub async fn get_thread_replies(
     limit: u32,
     cursor: Option<&[u8]>,
 ) -> Result<Vec<ThreadReply>> {
-    let mut conn = pool.acquire().await?;
+    let mut conn = crate::observability::acquire(
+        pool,
+        crate::observability::PoolRole::Writer,
+        crate::observability::DbOperation::SubscriptionHistory,
+    )
+    .await?;
     get_thread_replies_on(
         &mut conn,
         community_id,
@@ -599,7 +604,12 @@ pub async fn get_channel_window(
     cursor: Option<(DateTime<Utc>, Vec<u8>)>,
     kind_filter: Option<&[u32]>,
 ) -> Result<ChannelWindow> {
-    let mut conn = pool.acquire().await?;
+    let mut conn = crate::observability::acquire(
+        pool,
+        crate::observability::PoolRole::Writer,
+        crate::observability::DbOperation::SubscriptionHistory,
+    )
+    .await?;
     get_channel_window_on(
         &mut conn,
         community_id,
@@ -935,8 +945,13 @@ impl Db {
             ),
             None => ("thread_head", RoutePredicate::Bounded),
         };
-        if let RouteDecision::Replica(mut tx, entry, reason) =
-            self.route_read(path, predicate).await
+        if let RouteDecision::Replica(mut tx, entry, reason) = self
+            .route_read(
+                path,
+                predicate,
+                crate::observability::DbOperation::SubscriptionHistory,
+            )
+            .await
         {
             match crate::thread::get_thread_replies_on(
                 &mut tx,
@@ -1062,6 +1077,7 @@ impl Db {
             .route_read(
                 path,
                 RoutePredicate::from_channel_cursor(channel_id, &cursor),
+                crate::observability::DbOperation::SubscriptionHistory,
             )
             .await
         {
