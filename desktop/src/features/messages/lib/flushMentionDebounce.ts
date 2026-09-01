@@ -1,4 +1,4 @@
-import { isMentionActionable } from "./mentionPresentation";
+import { isMentionActionable, type MentionAction } from "./mentionPresentation";
 /**
  * Synchronously flush a pending mention debounce and resolve the correct
  * top-ranked suggestion. Used by handleMentionKeyDown to close the race
@@ -18,7 +18,7 @@ import {
 } from "./mentionSuggestionMapping";
 
 type MentionCandidateWithUI = MentionCandidateForRanking &
-  MentionSuggestionCandidate;
+  MentionSuggestionCandidate & { action?: MentionAction };
 
 export type FlushMentionDebounceResult =
   | { type: "match"; suggestion: MentionSuggestion; startIndex: number }
