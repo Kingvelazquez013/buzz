@@ -556,6 +556,38 @@ impl PkceOAuthTokenSource {
     /// unexpired file. That residual corner is outside the normal threat model
     /// (owner actively hardening their own cache file to 0400 against their own
     /// process).
+
+    /// Neutralize the matching rejected credential in B's own in-memory `state`
+    /// only — no disk I/O. The joiner matching-failure path calls this rather
+    /// than `expire_rejected`: the leader already ran the durable disk
+    /// invalidation under the cross-process file lock, and re-running disk
+    /// mutations from the lockless joiner can race with a concurrent process C
+    /// that persisted a valid replacement under the same lock (C's rename can
+    /// be overwritten by B's unfenced rename).
+    ///
+    /// Contract: only the access-token identity is checked — the refresh token
+    /// is left intact so callers reaching the recovery disk-read path below can
+    /// still attempt a fresh token exchange with the un-revoked refresh secret.
+    ///
+    /// Limitation: the joiner's match arm triggers on a same-digest leader
+    /// error regardless of error code (see `acquire`'s `Err` match arm). A
+    /// pre-lock failure (e.g. `LockTimeout`) with a matching rejected digest
+    /// therefore also reaches this helper, even though the leader never
+    /// durably invalidated the disk copy. In that case B's in-memory entry is
+    /// neutralized and B returns the shared error; the disk copy survives
+    /// intact. A subsequent plain `bearer()` (`rejected = None`) can re-read
+    /// the disk entry. This is a known bounded limitation: in-memory
+    /// neutralization is applied without a guarantee that the durable copy is
+    /// also gone.
+    fn expire_rejected_memory(&self, state: &mut Option<CachedToken>, rejected: Option<&str>) {
+        let Some(rej) = rejected else { return };
+        if let Some(tok) = state.as_mut() {
+            if tok.access_token == rej {
+                tok.expires_at = Some(0);
+            }
+        }
+    }
+
     fn expire_rejected(&self, state: &mut Option<CachedToken>, rejected: Option<&str>) {
         let Some(rej) = rejected else { return };
         // Neutralize the in-memory entry: force-expire so `is_expired` excludes
@@ -934,9 +966,19 @@ impl PkceOAuthTokenSource {
                     // here, so awaiting `state` cannot deadlock. Skipping the
                     // expiry would leave matching rejected X live, recreating
                     // the original P1 regression on the next plain `bearer()`.
+                    //
+                    // In-memory only (`expire_rejected_memory`, not
+                    // `expire_rejected`): the leader already ran the durable
+                    // disk invalidation under the file lock. Re-running disk
+                    // writes here is lockless — process C may have persisted a
+                    // valid replacement under the same lock between A's failure
+                    // and this rename, and B's unfenced rename would overwrite
+                    // it. Note: a subsequent plain `bearer()` (`rejected=None`)
+                    // calls `cached_hit` before the cross-process lock and can
+                    // therefore re-read the disk copy without acquiring the lock.
                     {
                         let mut state = self.state.lock().await;
-                        self.expire_rejected(&mut state, rejected);
+                        self.expire_rejected_memory(&mut state, rejected);
                     }
                     if let Some(hit) = self.usable_from_disk(rejected) {
                         return Ok(hit);
@@ -2309,11 +2351,22 @@ mod tests {
     /// then reads the disk lock-free — so a shared failure never forces an
     /// N-way browser storm when a sibling already wrote a valid cache entry.
     ///
+    /// The disk replacement is written AFTER B has deterministically joined the
+    /// slot (held state guard forces the joiner path; poll 1 confirms B is
+    /// blocked on `state.lock().await`). This ensures the test actually
+    /// exercises the joiner recovery branch rather than the initial fast-path
+    /// `cached_hit`. Removing the joiner disk-recovery branch must make the
+    /// test return Err(RefreshRejected) rather than Ok("sibling-replacement").
+    ///
     /// Disk-dependent: the replacement lives on disk, so `write_private_cache`
     /// must be available (i.e. Unix only).
     #[cfg(unix)]
     #[tokio::test]
     async fn test_joiner_shared_failure_recovers_disk_replacement() {
+        use std::future::Future as _;
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
+
         let dir = tempfile::tempdir().unwrap();
         let cfg = PkceOAuthConfig {
             discovery_url: "https://invalid.example.test/.well-known".into(),
@@ -2324,7 +2377,6 @@ mod tests {
         };
         let source = PkceOAuthTokenSource::new(cfg).unwrap();
 
-        // A sibling wrote a valid, unexpired replacement for the rejected token.
         let future_exp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2335,14 +2387,10 @@ mod tests {
             refresh_token: Some("rt".into()),
             expires_at: Some(future_exp),
         };
-        fs::write(
-            &source.cache_path,
-            serde_json::to_vec(&replacement).unwrap(),
-        )
-        .unwrap();
 
         // Pre-install a slot for this key and publish the leader's terminal
-        // failure, so the call below takes the joiner branch and wakes to Err.
+        // failure — digest matches "rejected-bytes" so the joiner enters the
+        // in-memory neutralization branch.
         let key: InflightKey = (source.lock_path(), AuthIntent::Headless);
         let slot = Arc::new(InflightSlot::new());
         inflight_registry().insert(key.clone(), slot.clone());
@@ -2351,16 +2399,160 @@ mod tests {
             Err(AuthError::RefreshRejected),
         );
 
-        let result = source
-            .acquire(AuthIntent::Headless, Some("rejected-bytes"))
-            .await;
+        // Hold the state mutex so the fast-path `try_lock` fails and B is
+        // forced down the joiner path. The slot is already published, so
+        // `slot.wait()` returns immediately; B then calls `state.lock().await`
+        // and suspends while we hold the guard.
+        let state_guard = source.state.lock().await;
 
+        let mut b_fut = pin!(source.acquire(AuthIntent::Headless, Some("rejected-bytes")));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(&waker);
+
+        // Poll 1: B falls through fast-path (try_lock fails), joins the
+        // pre-published slot, enters the Err match arm, and blocks on
+        // `state.lock().await` — structural proof B is on the joiner path.
+        assert!(
+            matches!(b_fut.as_mut().poll(&mut cx), Poll::Pending),
+            "poll 1 must be Pending: B is blocked at state.lock().await after waking to Err"
+        );
+
+        // Now install the disk replacement. B is definitely past the initial
+        // fast-path and will only see this token via `usable_from_disk` after
+        // reconciliation — the recovery branch we are testing.
+        fs::write(
+            &source.cache_path,
+            serde_json::to_vec(&replacement).unwrap(),
+        )
+        .unwrap();
+
+        // Release the mutex. B acquires the lock, calls expire_rejected_memory
+        // (empty state — no-op), then reads the disk replacement via
+        // `usable_from_disk` and returns Ok("sibling-replacement").
+        //
+        // Mutation check: removing the `usable_from_disk` recovery branch
+        // makes B return Err(RefreshRejected) instead — the assertion fails.
+        drop(state_guard);
+
+        let result = b_fut.await;
         inflight_registry().remove(&key);
 
         assert_eq!(
             result,
             Ok("sibling-replacement".to_string()),
-            "the joiner must read the disk replacement and not inherit the shared failure"
+            "the joiner must read the disk replacement and not inherit the shared failure — \
+             mutation check: removing the usable_from_disk branch returns Err(RefreshRejected)"
+        );
+    }
+
+    /// **Joiner failure cleanup must not modify the shared disk cache.**
+    ///
+    /// The matching-failure joiner calls `expire_rejected_memory` (in-process
+    /// state only). It must not write, truncate, rename, or remove the disk
+    /// cache. An independent process C may have persisted a valid replacement
+    /// under the cross-process file lock between A's failure and B's
+    /// reconciliation; an unfenced disk write from B would overwrite it.
+    ///
+    /// This test seeds X on disk, runs B as a joiner that wakes to a matching
+    /// failure, and asserts the disk file is byte-for-byte unchanged afterward.
+    ///
+    /// Mutation check: reverting the joiner arm to call `expire_rejected`
+    /// instead of `expire_rejected_memory` makes B read the disk file, see
+    /// `access_token == "rejected-X"`, set `expires_at = 0`, and overwrite the
+    /// file via `persist` or in-place truncate. The disk bytes change, and the
+    /// "disk unchanged" assertion fails — proving the unfenced write is exactly
+    /// the race that would overwrite any concurrent C write that landed between
+    /// A's failure and B's reconciliation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_joiner_failure_does_not_write_disk() {
+        use std::future::Future as _;
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = PkceOAuthConfig {
+            discovery_url: "https://invalid.example.test/.well-known".into(),
+            client_id: "test-client".into(),
+            scopes: vec!["offline_access".into()],
+            cache_namespace: "test".into(),
+            cache_dir_override: Some(dir.path().to_path_buf()),
+        };
+        let b = PkceOAuthTokenSource::new(cfg).unwrap();
+
+        let future_exp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 7200;
+
+        // Seed X on disk. The constructor may not create the parent directory
+        // without a pre-existing file, so ensure it exists first.
+        let token_x = CachedToken {
+            access_token: "rejected-X".into(),
+            refresh_token: Some("live-refresh".into()),
+            expires_at: Some(future_exp),
+        };
+        if let Some(parent) = b.cache_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let disk_before = serde_json::to_vec(&token_x).unwrap();
+        fs::write(&b.cache_path, &disk_before).unwrap();
+
+        // Pre-install a matching-failure slot (digest matches "rejected-X").
+        let key: InflightKey = (b.lock_path(), AuthIntent::Headless);
+        let slot = Arc::new(InflightSlot::new());
+        inflight_registry().insert(key.clone(), slot.clone());
+        slot.publish(
+            digest_of(Some("rejected-X")),
+            Err(AuthError::RefreshRejected),
+        );
+
+        // Hold B's state mutex: fast-path try_lock fails → joiner path;
+        // state.lock().await during reconciliation blocks until we drop.
+        let state_guard = b.state.lock().await;
+
+        let mut b_fut = pin!(b.acquire(AuthIntent::Headless, Some("rejected-X")));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(&waker);
+
+        // Poll 1: B falls through fast-path, joins the pre-published slot,
+        // wakes to Err, and parks at state.lock().await.
+        assert!(
+            matches!(b_fut.as_mut().poll(&mut cx), Poll::Pending),
+            "poll 1 must be Pending: B is parked at state.lock().await after waking to Err"
+        );
+
+        // Release the state guard. B acquires the lock, calls
+        // expire_rejected_memory (in-memory neutralization only — no disk I/O),
+        // then checks usable_from_disk. The disk token's access_token is
+        // "rejected-X" which equals `rejected`, so usable_from_disk filters it
+        // and returns None. B returns Err(RefreshRejected).
+        drop(state_guard);
+
+        let result = b_fut.await;
+        inflight_registry().remove(&key);
+
+        assert_eq!(
+            result,
+            Err(AuthError::RefreshRejected),
+            "B must propagate the shared failure"
+        );
+
+        // The disk file must be byte-for-byte identical to what was seeded.
+        // expire_rejected_memory must not have touched it.
+        //
+        // Mutation check: expire_rejected reads the disk file, finds
+        // access_token == "rejected-X", sets expires_at = 0, and rewrites
+        // the file. The bytes change and this assertion fails — proving the
+        // unfenced write is the exact race that overwrites a concurrent C write
+        // landing between A's failure and B's reconciliation.
+        let disk_after = fs::read(&b.cache_path).unwrap();
+        assert_eq!(
+            disk_after, disk_before,
+            "joiner failure cleanup must not modify the disk cache — \
+             mutation check: expire_rejected rewrites the file (expires_at=0), \
+             overwriting any concurrent write from process C"
         );
     }
 
@@ -2845,33 +3037,38 @@ mod tests {
 
     /// **Awaited reconciliation is falsifiable — `lock().await` cannot regress to `try_lock`.**
     ///
-    /// This test holds B's state mutex across slot publication to prove the joiner
-    /// cannot return before reconciliation completes. The structural sequence is:
+    /// Deterministic direct-poll proof: the test task holds B's state mutex and
+    /// manually polls a pinned real `acquire()` future at each state transition,
+    /// without spawning a task or relying on scheduler ordering.
     ///
-    /// 1. Register an unpublished slot for B's key; install stale X into B's state.
-    /// 2. Acquire B's state mutex — this makes the fast-path `try_lock` fail so B
-    ///    reaches `slot.wait()`, and it will block `lock().await` during reconciliation.
-    /// 3. Spawn B's `acquire()`, then `yield_now()` once. The joiner sprint from
-    ///    fast-path miss to `slot.wait()` has no intermediate async points, so B
-    ///    reliably parks at `slot.wait()` after exactly one yield.
-    /// 4. Publish Y while still holding the state mutex. B wakes from `slot.wait()`,
-    ///    calls `state.lock().await`, and suspends — control returns to this task.
-    /// 5. Assert `b_task.is_finished() == false`: B has not returned while the
-    ///    state mutex is held.
-    /// 6. Release the mutex. B acquires the lock, evaluates the adoption predicate,
-    ///    writes Y into state, and returns `Ok("token-Y")`.
-    /// 7. Verify B's state holds Y and a subsequent public `acquire()` returns Y
-    ///    from the in-memory cache (no second network call).
-    ///
-    /// Mutation check (`lock().await` → `try_lock()`): the fast-path held our
-    /// lock, but reconciliation's `try_lock` is called *after* B wakes from
-    /// `slot.wait()` — by that time we still hold the mutex. `try_lock` returns
-    /// `Err(WouldBlock)`, the adopt block is skipped, and B returns Y immediately.
-    /// Step 5 then observes `is_finished() == true` (B did not block), and
-    /// B's state still holds stale X. The step-7 `acquire()` hits the memory
-    /// cache and returns X — the exact stale-credential regression from pass 1.
+    /// Proof sequence:
+    /// 1. Seed B's state with stale X; register an unpublished slot.
+    /// 2. Hold B's state mutex — blocks the fast-path `try_lock` so B falls
+    ///    through to the registry, and will block `lock().await` when B tries
+    ///    to reconcile after waking.
+    /// 3. Poll B's `acquire()` once: no prior async suspension on the joiner
+    ///    path, so B reaches `slot.wait()`'s inner `rx.changed().await` and
+    ///    parks — the poll returns `Pending`. This is a structural proof, not a
+    ///    scheduler assumption.
+    /// 4. Publish Y and poll the same future again while the state mutex is
+    ///    still held. `slot.wait()` wakes and returns; B calls
+    ///    `state.lock().await`, which must park because we hold the mutex →
+    ///    this poll returns `Pending`.
+    ///    Mutation check: with `try_lock()` the adopt block is skipped and B
+    ///    returns immediately → this poll returns `Ready(Ok("token-Y"))`,
+    ///    failing the `Pending` assertion.
+    /// 5. Release the state guard; poll to completion (or `await` the future)
+    ///    and assert the result is `Ok("token-Y")`.
+    /// 6. Assert a subsequent plain `acquire(None)` returns Y from the
+    ///    in-memory cache — the P1 contract.
+    ///    Mutation check: `try_lock` leaves state == stale X, so this acquire
+    ///    returns X — the exact P1 stale-credential regression.
     #[tokio::test]
     async fn test_joiner_reconciliation_blocked_until_state_lock_released() {
+        use std::future::Future as _;
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
+
         let dir = tempfile::tempdir().unwrap();
         let b = PkceOAuthTokenSource::new(PkceOAuthConfig {
             discovery_url: "https://invalid.example.test/.well-known".into(),
@@ -2893,11 +3090,10 @@ mod tests {
             expires_at: Some(future_exp),
         };
 
-        let token_x = make_token("token-X"); // B's stale/rejected credential, seed into state.
-        let token_y = make_token("token-Y"); // shared leader result — must replace X after reconciliation.
+        let token_x = make_token("token-X"); // B's stale/rejected credential.
+        let token_y = make_token("token-Y"); // shared leader result — must replace X.
 
-        // Seed B's state with stale X (not expired, will look like a cache hit
-        // on plain bearer() if reconciliation is skipped).
+        // Seed B's state with stale X.
         {
             let mut state = b.state.lock().await;
             *state = Some(token_x.clone());
@@ -2908,67 +3104,59 @@ mod tests {
         let slot = Arc::new(InflightSlot::new());
         inflight_registry().insert(key.clone(), slot.clone());
 
-        // Hold the state mutex. This does two things:
-        //   (a) Forces the fast-path `try_lock` in `acquire()` to fail, so B
-        //       skips the cache check and falls through to the registry/joiner path.
-        //   (b) Blocks B's `state.lock().await` during reconciliation, giving us
-        //       a deterministic window to inspect B's completion status.
+        // Hold B's state mutex.
+        //   (a) The fast-path `try_lock` fails → B falls through to the joiner path.
+        //   (b) `state.lock().await` during reconciliation will block until we drop.
         let state_guard = b.state.lock().await;
 
-        // Spawn B's acquire with `rejected = Some("token-X")`.
-        let b_ref = b.clone();
-        let b_task =
-            tokio::spawn(async move { b_ref.acquire(AuthIntent::Headless, Some("token-X")).await });
+        // Pin B's acquire() future in this stack frame for manual polling.
+        let mut b_fut = pin!(b.acquire(AuthIntent::Headless, Some("token-X")));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(&waker);
 
-        // Yield once so B can sprint from fast-path miss to `slot.wait()`.
-        // The joiner path (lines 839–880 in acquire_locked) contains no async
-        // points between the registry lookup and `slot.wait().await`, so one
-        // yield is structurally sufficient.
-        tokio::task::yield_now().await;
+        // Poll 1: B has no async suspension before `slot.wait()`'s inner
+        // `rx.changed().await`. The slot is unpublished, so `changed()` parks.
+        // Result must be Pending — structural proof that B reached slot.wait().
+        assert!(
+            matches!(b_fut.as_mut().poll(&mut cx), Poll::Pending),
+            "poll 1 must be Pending: B is parked at slot.wait() awaiting publication"
+        );
 
-        // Publish Y. B wakes from `slot.wait()`, enters reconciliation, and
-        // calls `state.lock().await` — which suspends because we hold the mutex.
-        // Control returns here without B completing.
+        // Publish Y. `rx.changed()` wakes; on the next poll B exits slot.wait(),
+        // enters reconciliation, and calls `state.lock().await`.
         slot.publish(None, Ok(token_y.clone()));
         inflight_registry().remove(&key);
 
-        // Give B exactly one scheduling opportunity to try to make progress.
-        // In the single-threaded Tokio runtime, all tasks in a `yield_now()`
-        // window run to their next suspension point. B's next point is the
-        // blocked `lock().await` — it cannot return.
-        tokio::task::yield_now().await;
-
-        // B must not have completed: reconciliation is blocked on the state lock.
+        // Poll 2: `slot.wait()` returns Y; B calls `state.lock().await`.
+        // With `lock().await`: the mutex is held → parks → Pending.
+        // Mutation (`try_lock`): try_lock fails → adopt skipped → B returns
+        // Ok("token-Y") immediately → Ready, not Pending.
         //
-        // Mutation check: with `try_lock()` instead of `lock().await`, the
-        // `try_lock` call fails immediately (we hold the mutex), the adopt block
-        // is skipped, and B returns Y at once. `is_finished()` is then `true`
-        // here, and B's state remains stale X — the P1 regression.
+        // This poll is the exact mutation discriminator: Ready here is the
+        // bug (B completed without awaited reconciliation).
         assert!(
-            !b_task.is_finished(),
-            "B must remain pending while its state mutex is held — \
-             mutation check: `try_lock()` causes B to return early (is_finished() == true) \
-             and leaves stale X in state, recreating the P1 regression"
+            matches!(b_fut.as_mut().poll(&mut cx), Poll::Pending),
+            "poll 2 must be Pending: B must not return while state mutex is held — \
+             mutation check: `try_lock()` returns Ready here, proving early completion \
+             without reconciliation (the P1 regression)"
         );
 
         // Release the mutex. B acquires the lock, evaluates the adoption
-        // predicate (state == stale X, which matches the rejected token), writes
-        // Y into state, and returns Ok("token-Y").
+        // predicate (state == stale X, matches the rejected token), writes Y,
+        // and returns Ok("token-Y").
         drop(state_guard);
 
-        let result = b_task.await.unwrap();
+        // Await completion (B now owns the mutex).
+        let result = b_fut.await;
         assert_eq!(
             result,
             Ok("token-Y".to_string()),
             "B must return the shared token Y after reconciliation completes"
         );
 
-        // B's state must now hold Y. A subsequent plain acquire (no rejected
-        // token) hits the in-memory cache and returns Y without a second
-        // network call — the P1 contract.
-        //
-        // With the `try_lock` mutation, state still holds X here, and
-        // this acquire would return X (serving the rejected credential again).
+        // Subsequent plain acquire must return Y from the in-memory cache —
+        // the P1 contract. With the `try_lock` mutation, state still holds X
+        // and this acquire returns X (stale-credential regression).
         let rb_next = b
             .acquire(AuthIntent::Headless, None)
             .await
@@ -2976,8 +3164,7 @@ mod tests {
         assert_eq!(
             rb_next, "token-Y",
             "subsequent in-memory read must return Y, not stale X — \
-             mutation check: `try_lock()` leaves state == X, so this acquire \
-             returns X (the P1 stale-credential regression)"
+             mutation check: `try_lock()` leaves state == X, returning X"
         );
     }
 
@@ -2987,11 +3174,9 @@ mod tests {
     /// leader's shared result Y) in its `state` when the joiner reconciliation runs.
     /// The adoption predicate must evaluate to false for Z and leave it in place.
     ///
-    /// Deterministic setup: a not-yet-published slot forces B into `slot.wait()`,
-    /// a `yield_now()` lets B enter the wait, then Z is written to B's state
-    /// (real concurrent write, not an externally-held mutex). The slot is then
-    /// published with Y; B wakes, acquires the lock, and evaluates the predicate
-    /// with Z in state.
+    /// Deterministic setup via direct polling: register an unpublished slot; poll
+    /// B's `acquire()` once to park it at `slot.wait()`; write Z into B's state;
+    /// publish Y and await completion. No scheduler inference or `yield_now()`.
     ///
     /// Mutation check (unconditional adoption): if the reconciliation block writes
     /// `*state = Some(token.clone())` unconditionally, Z is overwritten with Y.
@@ -2999,6 +3184,10 @@ mod tests {
     /// is load-bearing.
     #[tokio::test]
     async fn test_joiner_preserve_distinct_newer_credential() {
+        use std::future::Future as _;
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
+
         let dir = tempfile::tempdir().unwrap();
         let b = PkceOAuthTokenSource::new(PkceOAuthConfig {
             discovery_url: "https://invalid.example.test/.well-known".into(),
@@ -3029,15 +3218,16 @@ mod tests {
         let slot = Arc::new(InflightSlot::new());
         inflight_registry().insert(key.clone(), slot.clone());
 
-        // Spawn B's acquire. In the single-threaded Tokio runtime, B does not
-        // run until we yield; once it runs it reaches slot.wait().await and
-        // pauses, returning control to this task.
-        let b_ref = b.clone();
-        let b_task =
-            tokio::spawn(async move { b_ref.acquire(AuthIntent::Headless, Some("token-X")).await });
-
-        // Yield so B can run up to its slot.wait() pause.
-        tokio::task::yield_now().await;
+        // Pin B's future and poll once to park it at slot.wait().
+        // No async suspension precedes slot.wait() on the joiner path, so the
+        // first poll is the structural proof that B is parked there.
+        let mut b_fut = pin!(b.acquire(AuthIntent::Headless, Some("token-X")));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            matches!(b_fut.as_mut().poll(&mut cx), Poll::Pending),
+            "B must park at slot.wait() on the first poll"
+        );
 
         // B is now suspended in slot.wait(). Write Z into B's state — this is a
         // real concurrent write that B will observe when it evaluates the
@@ -3050,9 +3240,9 @@ mod tests {
         // Publish Y to wake B. B will call lock().await, see Z (not expired, not
         // matching "token-X"), evaluate the predicate as false, and preserve Z.
         slot.publish(None, Ok(token_y.clone()));
-
-        let result = b_task.await.unwrap();
         inflight_registry().remove(&key);
+
+        let result = b_fut.await;
 
         assert_eq!(
             result,
