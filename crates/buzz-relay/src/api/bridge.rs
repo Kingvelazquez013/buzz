@@ -4579,8 +4579,8 @@ mod postgres_tests {
             .build()
             .expect("current_thread runtime");
 
-        let admin_url =
-            std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.to_string());
+        let admin_url = std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| crate::test_support::database_url());
 
         // Create a scratch database and run migrations on it.
         async fn scratch_db(admin: &PgPool, admin_url: &str, suffix: &str) -> (PgPool, String) {
@@ -4682,7 +4682,7 @@ mod postgres_tests {
         let state = rt.block_on(async {
             let mut config = crate::config::Config::from_env()
                 .expect("Config::from_env required — set DATABASE_URL, REDIS_URL, etc.");
-            config.database_url = TEST_DB_URL.to_string();
+            config.database_url = crate::test_support::database_url();
             config.redis_url =
                 std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
             config.relay_url = "wss://dispatch-test.local".to_string();
