@@ -770,6 +770,15 @@ pub struct AppState {
     /// byte-identically to a relay without the mesh. Access via
     /// [`AppState::mesh`].
     pub mesh: Arc<std::sync::OnceLock<crate::mesh_boot::MeshHandle>>,
+
+    /// NIP-FI PostgreSQL-final authority verifier.
+    ///
+    /// `Some` when NIP-FI is configured in enforce mode; `None` when disabled
+    /// (the default in environments without federated identity configuration).
+    /// Kind-9 ingest calls this after all NIP-29 membership and channel checks
+    /// have passed — a `None` verifier skips the NIP-FI gate and relies on
+    /// NIP-29 membership alone.
+    pub(crate) nip_fi: Option<Arc<dyn crate::nip_fi::NipFiVerify>>,
 }
 
 impl AppState {
@@ -945,6 +954,7 @@ impl AppState {
             // `crates/buzz-test-client` once those land).
             tracer: Arc::new(crate::conformance::NoopTracer),
             mesh: Arc::new(std::sync::OnceLock::new()),
+            nip_fi: None,
         };
         (
             state,
@@ -1385,6 +1395,137 @@ impl std::fmt::Debug for AppState {
     }
 }
 
+/// Build and wire the NIP-FI production verifier from environment variables.
+///
+/// Called by `main.rs` on the owned `AppState` before it is wrapped in `Arc`.
+///
+/// # Environment variables
+///
+/// | Variable | Description | Required |
+/// |---|---|---|
+/// | `BUZZ_NIP_FI_MODE` | `enforce` / `deny-protected` / `off` (default `off`) | no |
+/// | `BUZZ_NIP_FI_ISSUER` | Issuer URI (`iss` claim) | enforce only |
+/// | `BUZZ_NIP_FI_JWKS_URI` | JWKS endpoint URL (`https://`) | enforce only |
+/// | `BUZZ_NIP_FI_JWKS_REFRESH_SECS` | JWKS refresh interval in seconds (default `3600`) | no |
+/// | `BUZZ_NIP_FI_JWKS_DEADLINE_SECS` | JWKS snapshot hard deadline in seconds (default `7200`) | no |
+///
+/// In `off` mode (the default) the function does nothing and `state.nip_fi`
+/// remains `None`.  Kind-9 events are admitted by NIP-29 membership alone.
+///
+/// In `enforce` mode the function constructs a production
+/// `NipFiVerifierImpl<ProductionJwksSource<HttpJwksFetcher>>` and assigns it to
+/// `state.nip_fi`.  The relay **must** refuse to start on any configuration
+/// error (FI-INV-14: fail closed).
+pub fn init_nip_fi_from_env(state: &mut AppState) -> anyhow::Result<()> {
+    use buzz_auth::nip_fi::{
+        validate_nip_fi_config, FederatedAssertionVerifier, HttpJwksFetcher, IssuerJwksConfig,
+        IssuerPolicy, IssuerRegistry, JwksSourceContract, NipFiMode, ProductionJwksSource,
+    };
+    use std::sync::Arc;
+
+    let raw_mode = std::env::var("BUZZ_NIP_FI_MODE")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    let mode = match raw_mode.as_str() {
+        "" | "off" => NipFiMode::Off,
+        "enforce" => NipFiMode::Enforce,
+        "deny-protected" => NipFiMode::DenyProtected,
+        other => {
+            return Err(anyhow::anyhow!(
+                "BUZZ_NIP_FI_MODE must be \"off\", \"enforce\", or \"deny-protected\"; got {other:?}"
+            ));
+        }
+    };
+
+    if !matches!(mode, NipFiMode::Enforce) {
+        if matches!(mode, NipFiMode::DenyProtected) {
+            tracing::warn!(
+                "NIP-FI deny-protected mode: all kind-9 admission denies unconditionally"
+            );
+        }
+        return Ok(());
+    }
+
+    // enforce mode: parse issuer config and build the production verifier.
+    let issuer = std::env::var("BUZZ_NIP_FI_ISSUER").map_err(|_| {
+        anyhow::anyhow!("BUZZ_NIP_FI_ISSUER is required when BUZZ_NIP_FI_MODE=enforce")
+    })?;
+    let jwks_uri = std::env::var("BUZZ_NIP_FI_JWKS_URI").map_err(|_| {
+        anyhow::anyhow!("BUZZ_NIP_FI_JWKS_URI is required when BUZZ_NIP_FI_MODE=enforce")
+    })?;
+    let refresh_secs: u64 = std::env::var("BUZZ_NIP_FI_JWKS_REFRESH_SECS")
+        .unwrap_or_else(|_| "3600".into())
+        .parse()
+        .map_err(|e| anyhow::anyhow!("BUZZ_NIP_FI_JWKS_REFRESH_SECS: {e}"))?;
+    let deadline_secs: u64 = std::env::var("BUZZ_NIP_FI_JWKS_DEADLINE_SECS")
+        .unwrap_or_else(|_| "7200".into())
+        .parse()
+        .map_err(|e| anyhow::anyhow!("BUZZ_NIP_FI_JWKS_DEADLINE_SECS: {e}"))?;
+
+    let contract =
+        JwksSourceContract::new(jwks_uri, refresh_secs, deadline_secs).ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid NIP-FI JWKS config (invalid URI, zero timing, or deadline <= refresh)"
+            )
+        })?;
+
+    // Parse optional env vars for IssuerPolicy.
+    let audience = std::env::var("BUZZ_NIP_FI_AUDIENCE").map_err(|_| {
+        anyhow::anyhow!("BUZZ_NIP_FI_AUDIENCE is required when BUZZ_NIP_FI_MODE=enforce")
+    })?;
+    let max_assertion_age_secs: u64 = std::env::var("BUZZ_NIP_FI_MAX_ASSERTION_AGE_SECS")
+        .unwrap_or_else(|_| "3600".into())
+        .parse()
+        .map_err(|e| anyhow::anyhow!("BUZZ_NIP_FI_MAX_ASSERTION_AGE_SECS: {e}"))?;
+
+    use buzz_auth::nip_fi::{FreshnessClass, TokenClass};
+    use jsonwebtoken::Algorithm;
+
+    let policy = IssuerPolicy::new(
+        issuer.clone(),
+        vec![audience],
+        TokenClass::DedicatedNipFi,
+        FreshnessClass::OfflineJwt,
+        vec![Algorithm::RS256, Algorithm::ES256],
+        false, // require_attested_key
+        30,    // skew_seconds
+        max_assertion_age_secs,
+        None, // maximum_status_age_seconds (OfflineJwt only)
+        contract.clone(),
+    )
+    .map_err(|e| anyhow::anyhow!("invalid NIP-FI issuer policy: {e}"))?;
+
+    let mut registry = IssuerRegistry::new();
+    registry.insert(policy);
+
+    let jwks_config = IssuerJwksConfig {
+        issuer: issuer.clone(),
+        contract,
+    };
+
+    validate_nip_fi_config(
+        NipFiMode::Enforce,
+        &registry,
+        std::slice::from_ref(&jwks_config),
+    )
+    .map_err(|e| anyhow::anyhow!("NIP-FI startup validation failed: {e}"))?;
+
+    let key_source = ProductionJwksSource::new(vec![jwks_config], HttpJwksFetcher::new())
+        .ok_or_else(|| {
+            anyhow::anyhow!("NIP-FI: failed to build JWKS key source (duplicate issuer?)")
+        })?;
+
+    let verifier = FederatedAssertionVerifier::new(registry, key_source);
+    let db_arc = Arc::new(state.db.clone());
+    let impl_ = crate::nip_fi::NipFiVerifierImpl::new(db_arc, verifier);
+    state.nip_fi = Some(Arc::new(impl_) as Arc<dyn crate::nip_fi::NipFiVerify>);
+
+    tracing::info!(issuer = %issuer, "NIP-FI enforce mode: production verifier wired");
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1668,6 +1809,8 @@ pub(crate) mod tests {
             cancel: cancel.clone(),
             backpressure_count: Arc::clone(&bp),
             grace_limit: 3,
+            nip_fi_assertion: None,
+            nip_fi_proof_meta: std::sync::OnceLock::new(),
         };
 
         let mgr = ConnectionManager::new();
@@ -2512,5 +2655,114 @@ pub(crate) mod tests {
             }
             other => panic!("expected a restart close frame, got {other:?}"),
         }
+    }
+
+    // ── init_nip_fi_from_env unit tests ──────────────────────────────────────
+    //
+    // These tests call `init_nip_fi_from_env` directly against a real (lazy)
+    // AppState, verifying the production initialization path wires or leaves
+    // `state.nip_fi` correctly based on environment variables.
+
+    // Serialize the two env-mutation tests so they do not race each other.
+    // tokio::sync::Mutex is used here because it can be held across .await
+    // without triggering clippy::await_holding_lock.
+    static ENV_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    /// `BUZZ_NIP_FI_MODE` absent or `"off"` leaves `state.nip_fi = None`.
+    ///
+    /// This is the default: kind-9 events are admitted by NIP-29 membership
+    /// only.  No verifier is constructed and the function must succeed.
+    #[tokio::test]
+    async fn init_nip_fi_off_mode_leaves_nip_fi_none() {
+        // Hold the async mutex for the full test body to prevent concurrent
+        // env-var mutation from the sibling test.
+        let _guard = ENV_TEST_LOCK.lock().await;
+        let save = std::env::var("BUZZ_NIP_FI_MODE").ok();
+        std::env::remove_var("BUZZ_NIP_FI_MODE");
+
+        let (mut state, _) = build_minimal_app_state_for_init_test().await;
+        let result = super::init_nip_fi_from_env(&mut state);
+        assert!(result.is_ok(), "off mode must succeed: {result:?}");
+        assert!(state.nip_fi.is_none(), "off mode must leave nip_fi = None");
+
+        // Restore.
+        if let Some(v) = save {
+            std::env::set_var("BUZZ_NIP_FI_MODE", v);
+        }
+    }
+
+    /// `BUZZ_NIP_FI_MODE=enforce` without `BUZZ_NIP_FI_ISSUER` returns an
+    /// error — the relay refuses to start (FI-INV-14 fail-closed).
+    #[tokio::test]
+    async fn init_nip_fi_enforce_without_issuer_fails_closed() {
+        // Hold the async mutex for the full test body to prevent concurrent
+        // env-var mutation from the sibling test.
+        let _guard = ENV_TEST_LOCK.lock().await;
+        let save_mode = std::env::var("BUZZ_NIP_FI_MODE").ok();
+        let save_issuer = std::env::var("BUZZ_NIP_FI_ISSUER").ok();
+        std::env::set_var("BUZZ_NIP_FI_MODE", "enforce");
+        std::env::remove_var("BUZZ_NIP_FI_ISSUER");
+        std::env::remove_var("BUZZ_NIP_FI_JWKS_URI");
+
+        let (mut state, _) = build_minimal_app_state_for_init_test().await;
+        let result = super::init_nip_fi_from_env(&mut state);
+        assert!(
+            result.is_err(),
+            "enforce without BUZZ_NIP_FI_ISSUER must fail closed"
+        );
+        assert!(
+            state.nip_fi.is_none(),
+            "failed init must leave nip_fi = None"
+        );
+
+        // Restore (non-overlapping with other tests; lock not needed for restore).
+        match save_mode {
+            Some(v) => std::env::set_var("BUZZ_NIP_FI_MODE", v),
+            None => std::env::remove_var("BUZZ_NIP_FI_MODE"),
+        }
+        match save_issuer {
+            Some(v) => std::env::set_var("BUZZ_NIP_FI_ISSUER", v),
+            None => std::env::remove_var("BUZZ_NIP_FI_ISSUER"),
+        }
+    }
+
+    /// Helper: build a minimal `(AppState, _)` suitable for `init_nip_fi_from_env`
+    /// tests.  Uses a lazy (non-connecting) pool; tests that only call the env-var
+    /// parsing path do not need a live database.
+    async fn build_minimal_app_state_for_init_test() -> (AppState, AuditShutdownHandle) {
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.require_relay_membership = false;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        )
     }
 }

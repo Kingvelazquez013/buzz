@@ -366,8 +366,16 @@ async fn nip11_or_ws_handler(
             if state.shutting_down.load(Ordering::Relaxed) {
                 return (StatusCode::SERVICE_UNAVAILABLE, "relay restarting").into_response();
             }
+            // Extract the NIP-FI assertion header BEFORE the upgrade consumes
+            // the HTTP request headers.  The `Nostr-Federated-Identity` header
+            // must appear exactly once with a `Bearer <compact-JWS>` value.
+            // Any malformed, missing, or repeated header is extracted as `None`
+            // (no NIP-FI for this connection — the verifier rejects if needed).
+            let nip_fi_raw_token = extract_nip_fi_bearer(&headers);
             limit_relay_websocket(ws, max_frame_bytes)
-                .on_upgrade(move |socket| handle_connection(socket, state, addr, tenant))
+                .on_upgrade(move |socket| {
+                    handle_connection(socket, state, addr, tenant, nip_fi_raw_token)
+                })
                 .into_response()
         }
         Err(_) => {
@@ -386,6 +394,40 @@ async fn nip11_or_ws_handler(
             Json(nip11_document(&state, raw_host).await).into_response()
         }
     }
+}
+
+/// Extract the NIP-FI compact JWS from the `Nostr-Federated-Identity` HTTP
+/// header, if present and well-formed.
+///
+/// The header must appear exactly once with the value `Bearer <token>`.
+/// Returns `None` on any of:
+///   - header absent (plain NIP-42 connection)
+///   - header appears more than once (ambiguous — reject silently, caller will
+///     treat as missing and the verifier will reject if mode requires it)
+///   - header value not parseable as a valid UTF-8 string
+///   - value does not start with `Bearer ` (case-sensitive)
+///   - token after `Bearer ` is empty
+///
+/// Note: returning `None` here means "no NIP-FI header claimed".  The
+/// connection verifier rejects if the relay is in client-attached mode and
+/// no assertion was provided — that check happens in
+/// `handle_active_connection`.
+fn extract_nip_fi_bearer(headers: &axum::http::HeaderMap) -> Option<String> {
+    const HEADER_NAME: &str = "Nostr-Federated-Identity";
+    const BEARER_PREFIX: &str = "Bearer ";
+
+    let mut values = headers.get_all(HEADER_NAME).iter();
+    let first = values.next()?;
+    // Reject if the header appears more than once.
+    if values.next().is_some() {
+        return None;
+    }
+    let value = first.to_str().ok()?;
+    let token = value.strip_prefix(BEARER_PREFIX)?;
+    if token.is_empty() {
+        return None;
+    }
+    Some(token.to_string())
 }
 
 fn limit_relay_websocket<F>(

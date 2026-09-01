@@ -1485,19 +1485,24 @@ $$;
 CREATE FUNCTION community_write_fence_excluded_table(target NAME) RETURNS BOOLEAN
 LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE AS $$
     SELECT target::TEXT = ANY (ARRAY[
+        -- deletion control plane (0001+)
         'community_deletion_requests', 'community_deletion_approvals',
         'community_deletion_checkpoints', 'community_serving_write_leases',
         'community_deletion_executor_heartbeats', 'product_feedback',
         'rate_limit_violations',
+        -- NIP-FI identity foundation (0041)
         'authorization_operation_receipts', 'identity_enrollment_policies',
         'identity_bindings', 'identity_lifecycle_history',
         'identity_lifecycle_selectors',
+        -- NIP-FI authorization foundation (0042)
         'authorization_invalidation_domains', 'authorization_invalidation_floors',
         'authorization_authority_epochs', 'protected_object_authority',
         'authorization_event_capacity', 'authorization_events',
         'authorization_authentication_denial_attempts',
         'authorization_operation_version_delta_manifests',
-        'authorization_operation_version_deltas', 'authorization_admission_results'
+        'authorization_operation_version_deltas', 'authorization_admission_results',
+        -- NIP-FI proof replay ledger (0043)
+        'nip_fi_proof_replay_claims'
     ]::TEXT[])
 $$;
 
@@ -3787,3 +3792,37 @@ CREATE CONSTRAINT TRIGGER authorization_event_receipt_cardinality
     AFTER INSERT ON authorization_events
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW EXECUTE FUNCTION authorization_operation_receipt_event_guard_v1();
+
+-- ============================================================================
+-- NIP-FI proof replay-claim ledger (migrations 0043 + 0044).
+-- One row per admitted (community_id, proof_event_id) pair.
+-- The primary-key constraint name `nip_fi_proof_replay_claims_pkey` is the
+-- exact string the Rust admission path maps to AdmissionError::ProofReplayed.
+-- connection_id records the WebSocket connection that first claimed the proof.
+-- ============================================================================
+
+CREATE TABLE nip_fi_proof_replay_claims (
+    community_id    UUID NOT NULL REFERENCES communities(id),
+    proof_event_id  BYTEA NOT NULL CHECK (octet_length(proof_event_id) = 32),
+    retained_until  TIMESTAMPTZ NOT NULL,
+    connection_id   UUID NOT NULL,
+    recorded_at     TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
+    PRIMARY KEY (community_id, proof_event_id)
+);
+
+CREATE INDEX nip_fi_proof_replay_claims_retention
+    ON nip_fi_proof_replay_claims (retained_until);
+
+CREATE FUNCTION nip_fi_proof_replay_claims_immutable_v1() RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'nip_fi_proof_replay_claims is append-only'
+        USING ERRCODE = 'check_violation';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER nip_fi_proof_replay_claims_no_update_delete
+    BEFORE UPDATE OR DELETE ON nip_fi_proof_replay_claims
+    FOR EACH ROW EXECUTE FUNCTION nip_fi_proof_replay_claims_immutable_v1();
+CREATE TRIGGER nip_fi_proof_replay_claims_no_truncate
+    BEFORE TRUNCATE ON nip_fi_proof_replay_claims
+    FOR EACH STATEMENT EXECUTE FUNCTION nip_fi_reject_truncate_v1();

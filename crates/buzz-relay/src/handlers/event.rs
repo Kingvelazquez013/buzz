@@ -751,11 +751,27 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
         return;
     }
 
+    let nip_fi_context = conn.nip_fi_assertion.as_ref().and_then(|assertion| {
+        conn.nip_fi_proof_meta.get().map(|meta| {
+            let actor_bytes: [u8; 32] = auth_pubkey.to_bytes();
+            let proposal = crate::nip_fi::make_binding_proposal(&actor_bytes, assertion);
+            Box::new(super::ingest::NipFiIngestContext {
+                proof_event_id: meta.proof_event_id,
+                proof_expires_at: meta.proof_expires_at,
+                challenge: meta.challenge.clone(),
+                relay_url: meta.relay_url.clone(),
+                verified_assertion: assertion.clone(),
+                proposal,
+            })
+        })
+    });
+
     let ingest_auth = IngestAuth::Nip42 {
         pubkey: auth_pubkey,
         scopes,
         channel_ids,
         conn_id,
+        nip_fi_context,
     };
 
     match super::ingest::ingest_event(&state, &conn.tenant, event, ingest_auth).await {
@@ -1410,6 +1426,8 @@ mod tests {
             cancel: CancellationToken::new(),
             backpressure_count: Arc::new(AtomicU8::new(0)),
             grace_limit: 3,
+            nip_fi_assertion: None,
+            nip_fi_proof_meta: std::sync::OnceLock::new(),
         });
 
         super::handle_agent_observer_event(

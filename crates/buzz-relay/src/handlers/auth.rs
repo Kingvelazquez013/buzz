@@ -14,7 +14,7 @@ use std::sync::Arc;
 use axum::extract::ws::Message as WsMessage;
 use tracing::{debug, info, warn};
 
-use crate::connection::{AuthState, ConnectionState};
+use crate::connection::{AuthState, ConnectionState, NipFiProofMeta};
 use crate::protocol::RelayMessage;
 use crate::state::AppState;
 
@@ -77,6 +77,9 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
     // tampered, NIP-42 verification will fail before we ever inspect it.
     let auth_tag_json = extract_auth_tag_json(&event);
     let signed_auth_created_at = event.created_at.as_secs();
+    // Capture event ID bytes before the event is moved into verify_auth_event.
+    // Used to populate NipFiProofMeta when NIP-FI assertion is present.
+    let proof_event_id: [u8; 32] = event.id.to_bytes();
 
     let relay_url =
         crate::api::bridge::nip42_expected_relay_url(&state.config.relay_url, &conn.tenant);
@@ -280,6 +283,28 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
 
             info!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), "NIP-42 auth successful");
             *conn.auth_state.write().await = AuthState::Authenticated(auth_ctx);
+
+            // If this connection carries a NIP-FI assertion, record the NIP-42
+            // proof metadata so the event handler can build NipFiIngestContext.
+            // OnceLock::set is a no-op if already set — safe under concurrent
+            // AUTH attempts, though NIP-42 only allows one successful auth per
+            // connection.
+            if conn.nip_fi_assertion.is_some() {
+                // NIP-42 validity window: 10 minutes from event created_at.
+                const NIP42_PROOF_WINDOW_SECS: i64 = 600;
+                let proof_expires_at = chrono::DateTime::<chrono::Utc>::from_timestamp(
+                    signed_auth_created_at as i64 + NIP42_PROOF_WINDOW_SECS,
+                    0,
+                )
+                .unwrap_or_else(chrono::Utc::now);
+                let _ = conn.nip_fi_proof_meta.set(NipFiProofMeta {
+                    proof_event_id,
+                    proof_expires_at,
+                    challenge: challenge.clone(),
+                    relay_url: relay_url.clone(),
+                });
+            }
+
             state
                 .conn_manager
                 .set_authenticated_pubkey(conn_id, pubkey.to_bytes().to_vec());

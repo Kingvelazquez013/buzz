@@ -100,6 +100,13 @@ impl AssertionPolicyId {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Construct from raw bytes.  Only available in test builds — use
+    /// `compute_assertion_policy_id` in production.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 impl fmt::Debug for AssertionPolicyId {
@@ -139,6 +146,13 @@ impl TransportContractId {
     /// The stable 32-byte transport-contract digest.
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Construct from raw bytes.  Only available in test builds — use
+    /// `TransportContractId::core_client_attached` in production.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
 }
 

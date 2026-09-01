@@ -54,6 +54,32 @@ pub enum AuthState {
     Failed,
 }
 
+/// NIP-42 proof parameters extracted from a successfully validated AUTH event,
+/// retained on the connection for use with the NIP-FI assertion.
+///
+/// These fields are combined with `ConnectionState::nip_fi_assertion` to build
+/// a `NipFiIngestContext` at event-ingest time for kind-9 channel messages.
+#[derive(Clone)]
+pub struct NipFiProofMeta {
+    /// 32-byte event ID of the NIP-42 AUTH proof event.
+    pub proof_event_id: [u8; 32],
+    /// NIP-42 expiry deadline for this proof (auth event created_at + window).
+    pub proof_expires_at: chrono::DateTime<chrono::Utc>,
+    /// NIP-42 challenge string that was bound to the AUTH proof.
+    pub challenge: String,
+    /// Relay canonical URL that was bound to the AUTH proof.
+    pub relay_url: String,
+}
+
+impl std::fmt::Debug for NipFiProofMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NipFiProofMeta")
+            .field("proof_event_id", &hex::encode(self.proof_event_id))
+            .field("proof_expires_at", &self.proof_expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Per-connection state split by access pattern:
 /// - `auth_state`: RwLock (read-heavy after initial auth)
 /// - `subscriptions`: Mutex (write-heavy during REQ/CLOSE)
@@ -85,6 +111,16 @@ pub struct ConnectionState {
     pub backpressure_count: Arc<AtomicU8>,
     /// Configurable slow-client grace limit (from `Config::slow_client_grace_limit`).
     pub grace_limit: u8,
+    /// NIP-FI verified assertion, set once at WebSocket upgrade time if the
+    /// client sent a `Nostr-Federated-Identity: Bearer <compact-JWS>` header.
+    ///
+    /// `None` on connections without a NIP-FI assertion (plain NIP-42).
+    /// Not exposed in `Debug` output to keep assertion material off log lines.
+    pub nip_fi_assertion: Option<buzz_auth::nip_fi::VerifiedAssertion>,
+    /// NIP-42 proof parameters, set after a successful AUTH event when the
+    /// connection also carries a `nip_fi_assertion`.  Used to build the
+    /// `NipFiIngestContext` for kind-9 channel messages.
+    pub nip_fi_proof_meta: std::sync::OnceLock<NipFiProofMeta>,
 }
 
 impl ConnectionState {
@@ -123,11 +159,16 @@ impl ConnectionState {
 ///
 /// Acquires a connection semaphore permit, sends the NIP-42 AUTH challenge,
 /// then drives the send, heartbeat, and receive loops until the connection closes.
+///
+/// `nip_fi_raw_token` is the raw compact JWS from the
+/// `Nostr-Federated-Identity: Bearer <token>` HTTP header, extracted before
+/// the WebSocket upgrade.  `None` means no NIP-FI header was present.
 pub async fn handle_connection(
     socket: WebSocket,
     state: Arc<AppState>,
     addr: SocketAddr,
     tenant: TenantContext,
+    nip_fi_raw_token: Option<String>,
 ) {
     let conn_id = Uuid::new_v4();
     let cancel = CancellationToken::new();
@@ -142,7 +183,17 @@ pub async fn handle_connection(
         community_id,
         control,
         move || async move { check_state.db.is_community_active(community_id).await },
-        move |control| handle_active_connection(socket, run_state, addr, tenant, conn_id, control),
+        move |control| {
+            handle_active_connection(
+                socket,
+                run_state,
+                addr,
+                tenant,
+                conn_id,
+                control,
+                nip_fi_raw_token,
+            )
+        },
     )
     .await;
 }
@@ -154,6 +205,7 @@ async fn handle_active_connection(
     tenant: TenantContext,
     conn_id: Uuid,
     control: CommunityConnectionControl,
+    nip_fi_raw_token: Option<String>,
 ) {
     let cancel = control.cancellation_token();
     let disconnect_reason = control.disconnect_reason();
@@ -163,6 +215,29 @@ async fn handle_active_connection(
             warn!("Connection limit reached, rejecting {addr}");
             return;
         }
+    };
+
+    // Verify the NIP-FI assertion at connection time if the header was present.
+    // Fail closed: if a header was present but verification fails or no verifier
+    // is configured, reject the connection immediately.
+    let nip_fi_assertion = match nip_fi_raw_token {
+        None => None,
+        Some(ref token) => match state.nip_fi.as_ref() {
+            None => {
+                // NIP-FI header present but verifier not configured.
+                warn!(conn_id = %conn_id, addr = %addr,
+                    "NIP-FI header present but verifier not configured — rejecting connection");
+                return;
+            }
+            Some(verifier) => match verifier.verify_compact_jws(token) {
+                Ok(assertion) => Some(assertion),
+                Err(e) => {
+                    warn!(conn_id = %conn_id, addr = %addr,
+                        "NIP-FI assertion verification failed at upgrade: {e:?}");
+                    return;
+                }
+            },
+        },
     };
 
     let challenge = generate_challenge();
@@ -193,6 +268,8 @@ async fn handle_active_connection(
         cancel: cancel.clone(),
         backpressure_count: Arc::clone(&backpressure_count),
         grace_limit: state.config.slow_client_grace_limit,
+        nip_fi_assertion,
+        nip_fi_proof_meta: std::sync::OnceLock::new(),
     });
 
     info!(conn_id = %conn_id, addr = %addr, "WebSocket connection established");
@@ -678,6 +755,8 @@ pub(crate) mod tests {
             cancel: CancellationToken::new(),
             backpressure_count: Arc::new(AtomicU8::new(0)),
             grace_limit: 3,
+            nip_fi_assertion: None,
+            nip_fi_proof_meta: std::sync::OnceLock::new(),
         };
         (Arc::new(conn), send_rx)
     }

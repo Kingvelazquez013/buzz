@@ -261,3 +261,45 @@ impl fmt::Debug for CanonicalCapabilities {
         f.write_str("CanonicalCapabilities([REDACTED])")
     }
 }
+
+/// Test-only construction path for [`VerifiedAssertion`].
+///
+/// This module is compiled under `#[cfg(test)]` (direct crate tests) or when
+/// the `test-utils` feature is enabled.  Integration tests in `buzz-relay` and
+/// other crates enable `buzz-auth/test-utils` to access this path.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support {
+    use super::*;
+
+    /// Mint a minimal [`VerifiedAssertion`] for use in integration tests.
+    ///
+    /// The returned assertion has:
+    /// - `issuer` and `subject` as provided
+    /// - A single `authority_deadline` at the provided timestamp
+    /// - Empty capabilities
+    /// - A placeholder compact JWS (`"test-jws"`) that will fail real
+    ///   revalidation — the pg_integration mock verifier bypasses that check
+    pub fn minimal_verified_assertion(
+        issuer: &str,
+        subject: &str,
+        authority_deadline: chrono::DateTime<chrono::Utc>,
+    ) -> VerifiedAssertion {
+        use crate::nip_fi::config::{AssertionPolicyId, TransportContractId};
+
+        VerifiedAssertion::seal(
+            issuer.to_string(),
+            subject.to_string(),
+            None, // asserted_key
+            CanonicalCapabilities::from_pairs(vec![]),
+            vec![authority_deadline],
+            AssertionPolicyId::for_test([0u8; 32]),
+            TransportContractId::for_test([0u8; 32]),
+            RevalidationDependencies::new(
+                "test-key-id".to_string(),
+                1,
+                authority_deadline,
+                "test-jws".to_string(),
+            ),
+        )
+    }
+}

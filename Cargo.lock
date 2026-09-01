@@ -1291,6 +1291,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "infer",
+ "jsonwebtoken",
  "mesh-llm-host-runtime",
  "mesh-llm-sdk",
  "metrics",
@@ -10531,6 +10532,7 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 

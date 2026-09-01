@@ -465,6 +465,14 @@ async fn main() -> anyhow::Result<()> {
         relay_keypair,
         media_storage,
     );
+
+    // NIP-FI federated-identity authority verifier.
+    //
+    // Wire before Arc::new so the field is set on the owned value.
+    // init_nip_fi_from_env reads BUZZ_NIP_FI_MODE and related vars; the relay
+    // refuses to start on any configuration error (FI-INV-14: fail closed).
+    let mut app_state = app_state;
+    buzz_relay::state::init_nip_fi_from_env(&mut app_state)?;
     let state = Arc::new(app_state);
 
     // Inter-relay mesh (BUZZ_MESH seam). `boot_mesh` returns None when the

@@ -1697,6 +1697,55 @@ impl Db {
         Ok(result)
     }
 
+    /// Insert an event and its thread metadata using a caller-owned transaction.
+    ///
+    /// This is the Design-C seam used by `buzz-relay`'s NIP-FI atomic path to
+    /// keep the event insert inside the same READ COMMITTED transaction as the
+    /// community write assertion, NIP-FI writer lock, and admission authority
+    /// writes.  The caller owns `BEGIN` and `COMMIT`/`ROLLBACK` — this function
+    /// only executes the insert rows.
+    ///
+    /// **Post-commit side effects** (best-effort mention indexing) are NOT run
+    /// here because there is no committed state yet.  Callers should run them
+    /// after a successful commit:
+    /// ```ignore
+    /// if was_inserted {
+    ///     if let Err(e) = db.insert_mentions_post_commit(community_id, event, channel_id).await { … }
+    /// }
+    /// ```
+    pub async fn insert_event_with_thread_metadata_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        community_id: CommunityId,
+        event: &nostr::Event,
+        channel_id: Option<Uuid>,
+        thread_meta: Option<crate::event::ThreadMetadataParams<'_>>,
+    ) -> Result<(StoredEvent, bool)> {
+        crate::event::insert_event_with_thread_metadata_tx(
+            tx,
+            community_id,
+            event,
+            channel_id,
+            thread_meta,
+        )
+        .await
+    }
+
+    /// Insert best-effort mention index rows after a committed NIP-FI atomic write.
+    ///
+    /// Should be called once after a successful commit of
+    /// `insert_event_with_thread_metadata_in_tx`.  Failure is logged and ignored.
+    pub async fn insert_mentions_post_commit(
+        &self,
+        community_id: CommunityId,
+        event: &nostr::Event,
+        channel_id: Option<Uuid>,
+    ) {
+        if let Err(e) = crate::insert_mentions(&self.pool, community_id, event, channel_id).await {
+            tracing::warn!(event_id = %event.id, "Failed to insert mentions after NIP-FI commit: {e}");
+        }
+    }
+
     /// Backfill `d_tag` for existing NIP-33 events (kind 30000–39999) that have `d_tag IS NULL`.
     ///
     /// Idempotent — safe to call on every startup. No-ops when all rows are already populated.

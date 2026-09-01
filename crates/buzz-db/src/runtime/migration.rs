@@ -699,7 +699,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 42);
+        assert_eq!(migrations.len(), 44);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1262,9 +1262,11 @@ mod postgres_tests {
         assert!(authorization_foundation.contains("CREATE TABLE protected_object_authority"));
         assert!(authorization_foundation.contains("CREATE TABLE authorization_admission_results"));
 
-        // The consolidated desired-state exclusion function must byte-match
-        // migration 0042's CREATE OR REPLACE body, or a future schema
-        // consolidation would silently drop NIP-FI relations from the ledger.
+        // The consolidated desired-state exclusion function must byte-match the
+        // most recent CREATE OR REPLACE in the migration sequence.  Migration
+        // 0042 defines the initial NIP-FI exclusion list; migration 0043
+        // extends it with `nip_fi_proof_replay_claims`.  schema.sql must
+        // therefore match 0043's definition, not 0042's.
         fn extract_excluded_table_array(sql: &str) -> &str {
             let anchor = "community_write_fence_excluded_table(target NAME) RETURNS BOOLEAN";
             let start = sql.find(anchor).expect("exclusion function definition");
@@ -1275,10 +1277,24 @@ mod postgres_tests {
                 + array_start;
             &sql[array_start..array_end]
         }
+
+        // NIP-FI proof replay claims (migration 0043): idempotency ledger for
+        // admission proofs.  Never fence-attached (immutable ledger relation).
+        // 0043 also issues a CREATE OR REPLACE for community_write_fence_excluded_table
+        // to add 'nip_fi_proof_replay_claims'; that extended definition is the
+        // one schema.sql must track.
+        assert_eq!(migrations[42].version, 43);
+        let replay_claims = migrations[42].sql.as_str();
+        assert!(replay_claims.contains("CREATE TABLE nip_fi_proof_replay_claims"));
+        assert!(
+            replay_claims
+                .contains("CREATE OR REPLACE FUNCTION community_write_fence_excluded_table"),
+            "migration 0043 must update the exclusion function"
+        );
         assert_eq!(
-            extract_excluded_table_array(authorization_foundation),
+            extract_excluded_table_array(replay_claims),
             extract_excluded_table_array(desired_schema),
-            "schema.sql exclusion list drifted from migration 0042"
+            "schema.sql exclusion list drifted from migration 0043"
         );
     }
 

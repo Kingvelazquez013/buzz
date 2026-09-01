@@ -4,6 +4,10 @@
 
 mod admission;
 mod build_info;
+/// NIP-FI PostgreSQL-final authority: sealed request context and admission
+/// orchestration.  All construction paths are private to this module;
+/// external crates cannot mint a sealed context or produce an admission result.
+mod nip_fi;
 mod rejection;
 
 /// REST API route handlers.
