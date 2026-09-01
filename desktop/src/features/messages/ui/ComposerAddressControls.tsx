@@ -180,11 +180,7 @@ export function ComposerMentionButton({
           <Tooltip disableHoverableContent>
             <TooltipTrigger asChild>
               <button
-                aria-label={
-                  hasAgents
-                    ? "Manage automatic agent mentions"
-                    : "Mention someone"
-                }
+                aria-label={hasAgents ? "Manage mentions" : "Mention someone"}
                 className={cn(
                   "flex h-8 items-center justify-center rounded-lg focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50",
                   showActiveChrome
@@ -205,9 +201,7 @@ export function ComposerMentionButton({
               </button>
             </TooltipTrigger>
             <TooltipContent>
-              {hasAgents
-                ? "Manage automatic agent mentions"
-                : "Mention someone"}
+              {hasAgents ? "Manage mentions" : "Mention someone"}
             </TooltipContent>
           </Tooltip>
           <AnimatePresence

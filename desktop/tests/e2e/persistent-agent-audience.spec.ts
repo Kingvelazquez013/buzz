@@ -92,6 +92,20 @@ async function pressPrimaryShiftM(page: Page) {
   await page.keyboard.press(`${isMac ? "Meta" : "Control"}+Shift+M`);
 }
 
+async function readPersistedDraftContent(page: Page, draftKey: string) {
+  return page.evaluate((key) => {
+    for (const storageKey of Object.keys(window.localStorage)) {
+      if (!storageKey.startsWith("buzz-drafts.v2:")) continue;
+      const drafts = JSON.parse(
+        window.localStorage.getItem(storageKey) ?? "{}",
+      ) as Record<string, { content?: string }>;
+      const draft = drafts[key];
+      if (draft) return draft.content ?? "";
+    }
+    return "";
+  }, draftKey);
+}
+
 async function readOutgoingMentionPubkeys(page: Page, content: string) {
   return page.evaluate((expectedContent) => {
     const signedEvent = window.__BUZZ_E2E_SIGNED_EVENTS__?.find(
@@ -271,9 +285,9 @@ test("automatically mentions multiple agents from the mention picker", async ({
   page,
 }) => {
   await installAudienceFixtures(page);
-  await openGeneral(page);
+  await openThread(page);
 
-  const composer = channelComposer(page);
+  const composer = threadComposer(page);
   await automaticallyMention(composer, "Morgarita");
   await automaticallyMention(composer, "Vogue");
 
@@ -284,7 +298,7 @@ test("automatically mentions multiple agents from the mention picker", async ({
     composer.getByTestId(`composer-address-lock-${AGENT_B}`),
   ).toBeVisible();
   await expect(
-    composer.getByRole("button", { name: "Manage automatic agent mentions" }),
+    composer.getByRole("button", { name: "Manage mentions" }),
   ).toBeVisible();
 });
 
@@ -292,21 +306,25 @@ test("keeps the composer and global automatic mention settings synchronized", as
   page,
 }) => {
   await installAudienceFixtures(page);
-  await openGeneral(page);
+  await openThread(page);
 
-  const composer = channelComposer(page);
+  const composer = threadComposer(page);
   await composer.getByTestId("message-insert-mention").click();
-  const optionsTrigger = composer.getByTestId("mention-options-trigger");
-  await expect(optionsTrigger).toHaveAttribute("aria-expanded", "false");
-  await composer
-    .getByTestId("mention-autocomplete")
-    .getByRole("button", { name: "Automatically mention Morgarita" })
-    .click();
-  await expect(optionsTrigger).toHaveAttribute("aria-expanded", "true");
   const composerToggle = composer.getByTestId(
     "mention-keep-agents-pinned-toggle",
   );
   await expect(composerToggle).toHaveAttribute("data-state", "unchecked");
+  const settings = composer.getByTestId("mention-options-settings");
+  await expect(settings).toBeVisible();
+  const settingsBox = await settings.boundingBox();
+  const heading = settings.getByText("Automatically mention agents");
+  const headingBox = await heading.boundingBox();
+  expect(settingsBox?.width).toBeGreaterThanOrEqual(300);
+  expect(headingBox?.height).toBeLessThanOrEqual(20);
+  await composer
+    .getByTestId("mention-autocomplete")
+    .getByRole("button", { name: "Automatically mention Morgarita" })
+    .click();
   await expect(composerToggle).toHaveAttribute("data-state", "checked", {
     timeout: 1_500,
   });
@@ -316,8 +334,7 @@ test("keeps the composer and global automatic mention settings synchronized", as
     .getByRole("button", { name: "Turn off" })
     .click();
   await expect(composer.getByTestId("mention-autocomplete")).toBeVisible();
-  await expect(optionsTrigger).toHaveAttribute("aria-expanded", "true");
-  await expect(composerToggle).toHaveAttribute("data-state", "checked");
+  await expect(composer.getByTestId("mention-options-settings")).toBeVisible();
   await expect(composerToggle).toHaveAttribute("data-state", "unchecked", {
     timeout: 1_500,
   });
@@ -336,7 +353,6 @@ test("keeps the composer and global automatic mention settings synchronized", as
     composer.getByTestId(`composer-address-lock-${AGENT_A}`),
   ).toHaveCount(0);
   await composer.getByTestId("message-insert-mention").click();
-  await composer.getByTestId("mention-options-trigger").click();
   await expect(
     composer.getByTestId("mention-keep-agents-pinned-toggle"),
   ).toHaveAttribute("data-state", "unchecked");
@@ -347,7 +363,7 @@ test("keeps the composer and global automatic mention settings synchronized", as
   ).toHaveAttribute("aria-pressed", "false");
 });
 
-test("hides automatic mention state while disabled without clearing the draft", async ({
+test("the disabled root composer preserves its explicit draft without audience controls", async ({
   page,
 }) => {
   await installAudienceFixtures(page);
@@ -355,11 +371,8 @@ test("hides automatic mention state while disabled without clearing the draft", 
 
   const composer = channelComposer(page);
   const input = composer.getByTestId("message-input");
-  await automaticallyMention(composer, "Morgarita");
-  await input.type("draft text");
-  await expect(
-    composer.getByTestId(`composer-address-lock-${AGENT_A}`),
-  ).toBeVisible();
+  await input.fill("explicit draft text");
+  await expect(composer.getByTestId("composer-address-locks")).toHaveCount(0);
 
   await page.getByTestId("channel-management-trigger").click();
   await expect(page.getByTestId("channel-management-sheet")).toBeVisible();
@@ -368,22 +381,8 @@ test("hides automatic mention state while disabled without clearing the draft", 
   await page.getByTestId("auxiliary-panel-close").click();
 
   await expect(input).toHaveAttribute("contenteditable", "false");
-  await expect(input).toHaveText("@Morgarita draft text");
-  await expect(
-    composer.getByTestId(`composer-address-lock-${AGENT_A}`),
-  ).toHaveCount(0);
-
-  await page.getByTestId("channel-management-trigger").click();
-  await expect(page.getByTestId("channel-management-sheet")).toBeVisible();
-  await page.getByTestId("channel-management-unarchive").click();
-  await expect(page.getByTestId("channel-management-archive")).toBeVisible();
-  await page.getByTestId("auxiliary-panel-close").click();
-
-  await expect(input).toHaveAttribute("contenteditable", "true");
-  await expect(input).toHaveText("@Morgarita draft text");
-  await expect(
-    composer.getByTestId(`composer-address-lock-${AGENT_A}`),
-  ).toBeVisible();
+  await expect(input).toHaveText("explicit draft text");
+  await expect(composer.getByTestId("composer-address-locks")).toHaveCount(0);
 });
 
 test("Tab inserts a one-time agent mention by default", async ({ page }) => {
@@ -418,12 +417,11 @@ test("disabling automatic mentions leaves the composer empty after send", async 
 }) => {
   await keepMentionedAgentsPinned(page);
   await installAudienceFixtures(page);
-  await openGeneral(page);
+  await openThread(page);
 
-  const composer = channelComposer(page);
+  const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
   await composer.getByTestId("message-insert-mention").click();
-  await composer.getByTestId("mention-options-trigger").click();
   const preference = composer.getByTestId("mention-keep-agents-pinned-toggle");
   await expect(preference).toHaveAttribute("data-state", "checked");
   await preference.click();
@@ -452,9 +450,9 @@ test("primary+Shift+M addresses the default agent, then toggles the highlighted 
 }) => {
   await keepMentionedAgentsPinned(page);
   await installAudienceFixtures(page);
-  await openGeneral(page);
+  await openThread(page);
 
-  const composer = channelComposer(page);
+  const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
   await input.fill("draft text");
   await pressPrimaryShiftM(page);
@@ -500,10 +498,10 @@ test("primary+Shift+M favors the most recently mentioned eligible agent", async 
   page,
 }) => {
   await installAudienceFixtures(page);
-  await openGeneral(page);
+  await openThread(page);
   await emitMockMessage(page, "Please ask Vogue", [AGENT_B]);
 
-  const input = channelComposer(page).getByTestId("message-input");
+  const input = threadComposer(page).getByTestId("message-input");
   await input.fill("draft text");
   await input.press("ArrowLeft");
   await input.press("ArrowLeft");
@@ -522,13 +520,13 @@ test("the mention button opens settings and can undo an address", async ({
   page,
 }) => {
   await installAudienceFixtures(page);
-  await openGeneral(page);
+  await openThread(page);
 
-  const composer = channelComposer(page);
+  const composer = threadComposer(page);
   await automaticallyMention(composer, "Morgarita");
   const input = composer.getByTestId("message-input");
   const ingress = composer.getByRole("button", {
-    name: "Manage automatic agent mentions",
+    name: "Manage mentions",
   });
 
   await input.type("draft text");
@@ -536,31 +534,34 @@ test("the mention button opens settings and can undo an address", async ({
   const menu = composer.getByTestId("mention-autocomplete");
   await expect(menu).toBeVisible();
   await expect(input).toHaveText("@Morgarita draft text");
-  await page.getByTestId("mention-options-trigger").click();
   await expect(
     page.getByTestId("mention-keep-agents-pinned-toggle"),
   ).toBeVisible();
   const layerBox = await composer
     .getByTestId("mention-autocomplete-layer")
     .boundingBox();
-  const optionsBox = await page
-    .getByTestId("mention-options-trigger")
+  const settingsBox = await page
+    .getByTestId("mention-options-settings")
     .boundingBox();
+  const menuBox = await menu.boundingBox();
   expect(layerBox).not.toBeNull();
-  expect(optionsBox).not.toBeNull();
-  if (!layerBox || !optionsBox) throw new Error("Mention tray is not laid out");
-  await page.mouse.click(layerBox.x + 4, optionsBox.y + optionsBox.height / 2);
+  expect(settingsBox).not.toBeNull();
+  expect(menuBox).not.toBeNull();
+  if (!layerBox || !settingsBox || !menuBox) {
+    throw new Error("Mention tray is not laid out");
+  }
+  await page.mouse.click(
+    layerBox.x + layerBox.width / 2,
+    (settingsBox.y + settingsBox.height + menuBox.y) / 2,
+  );
   await expect(menu).toHaveCount(0);
   await expect(input).toHaveText("@Morgarita draft text");
   await ingress.click();
   await expect(menu).toBeVisible();
-  await expect(page.getByTestId("mention-options-trigger")).toHaveAttribute(
-    "aria-expanded",
-    "false",
-  );
+  await expect(page.getByTestId("mention-options-settings")).toBeVisible();
   await expect(
     page.getByTestId("mention-keep-agents-pinned-toggle"),
-  ).toHaveCount(0);
+  ).toBeVisible();
   await ingress.click();
   await expect(menu).toHaveCount(0);
   await expect(input).toHaveText("@Morgarita draft text");
@@ -569,16 +570,16 @@ test("the mention button opens settings and can undo an address", async ({
   await expect(page.getByTestId("user-profile-panel")).toHaveCount(0);
   await expect(
     menu.getByRole("button", {
-      name: "Don't automatically mention Morgarita in this conversation",
+      name: "Don't automatically mention Morgarita in this thread",
     }),
   ).toHaveAttribute("aria-pressed", "true");
 
   await menu
     .getByRole("button", {
-      name: "Don't automatically mention Morgarita in this conversation",
+      name: "Don't automatically mention Morgarita in this thread",
     })
     .click();
-  await expect(input).toHaveText("draft text");
+  await expect(input).toHaveText("@Morgarita draft text");
   await expect(
     composer.getByRole("button", { name: "Mention someone" }),
   ).toBeVisible();
@@ -656,7 +657,7 @@ test("always-mentioned agents remain selected without replaying their animation 
     { timeout: 500 },
   );
   await expect(
-    composer.getByRole("button", { name: "Manage automatic agent mentions" }),
+    composer.getByRole("button", { name: "Manage mentions" }),
   ).toBeVisible();
   await expect(input).toBeFocused();
   await expect(composer.getByTestId("mention-autocomplete")).toHaveCount(0);
@@ -690,7 +691,7 @@ test("always-mentioned agents remain selected without replaying their animation 
   ).toHaveCount(1);
 });
 
-test("the unfocused main composer keeps its dismissed mention menu closed through a thread send", async ({
+test("the unfocused root composer keeps its dismissed mention menu closed through a thread send", async ({
   page,
 }) => {
   await installAudienceFixtures(page, { sendMessageDelayMs: 1_500 });
@@ -698,12 +699,7 @@ test("the unfocused main composer keeps its dismissed mention menu closed throug
 
   const mainComposer = channelComposer(page);
   const mainInput = mainComposer.getByTestId("message-input");
-  await automaticallyMention(mainComposer, "Morgarita");
-  await mainInput.fill("@Morgarita earlier message");
-  await mainInput.press("Enter");
-  await expect(mainInput).toHaveText("@Morgarita ");
-  await mainInput.fill("@Morgarita");
-  await expect(mainInput).toHaveText("@Morgarita");
+  await mainInput.fill("@Mor");
   await expect(mainComposer.getByTestId("mention-autocomplete")).toBeVisible();
   await mainInput.press("Escape");
   await expect(mainComposer.getByTestId("mention-autocomplete")).toHaveCount(0);
@@ -760,9 +756,9 @@ test("pressing a mention overlay's own container keeps it open", async ({
 }) => {
   await keepMentionedAgentsPinned(page);
   await installAudienceFixtures(page);
-  await openGeneral(page);
+  await openThread(page);
 
-  const composer = channelComposer(page);
+  const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
   await composer.getByTestId("message-insert-mention").click();
   const list = composer.getByTestId("mention-autocomplete");
@@ -782,7 +778,6 @@ test("pressing a mention overlay's own container keeps it open", async ({
   // Same hazard on the options surface, where it needs no exotic scrollbar
   // setting to reproduce: the switch's label text is a container press, so the
   // overlay used to vanish before the forwarded click reached the switch.
-  await composer.getByTestId("mention-options-trigger").click();
   const preference = composer.getByTestId("mention-keep-agents-pinned-toggle");
   await expect(preference).toHaveAttribute("data-state", "checked");
   await composer
@@ -793,14 +788,14 @@ test("pressing a mention overlay's own container keeps it open", async ({
   await expect(list).toBeVisible();
 });
 
-test("the mention Options controls are reachable and operable by keyboard", async ({
+test("the mention setting is reachable and operable by keyboard", async ({
   page,
 }) => {
   await keepMentionedAgentsPinned(page);
   await installAudienceFixtures(page);
   await openThread(page);
 
-  const mainComposer = channelComposer(page);
+  const mainComposer = threadComposer(page);
   const mainInput = mainComposer.getByTestId("message-input");
   await mainInput.click();
   await mainInput.fill("@Mor");
@@ -821,23 +816,15 @@ test("the mention Options controls are reachable and operable by keyboard", asyn
   });
 
   // Forward Tab still selects the highlighted suggestion, so Shift+Tab is the
-  // route into the overlay. It only reaches the Options controls if the focus
-  // gate treats them as composer-owned focus rather than unmounting on the
-  // editor's blur.
+  // route into the always-visible setting. The focus gate must treat it as
+  // composer-owned focus rather than unmounting on the editor's blur.
   await mainInput.press("Shift+Tab");
-  const optionsTrigger = mainComposer.getByTestId("mention-options-trigger");
-  await expect(optionsTrigger).toBeFocused();
-
-  await page.keyboard.press("Enter");
   const preference = mainComposer.getByTestId(
     "mention-keep-agents-pinned-toggle",
   );
-  await expect(preference).toBeVisible();
+  await expect(preference).toBeFocused();
   await expect(preference).toHaveAttribute("data-state", "checked");
 
-  // The switch sits before its trigger in the expanded surface's tab order.
-  await page.keyboard.press("Shift+Tab");
-  await expect(preference).toBeFocused();
   await page.keyboard.press("Space");
   await expect(preference).toHaveAttribute("data-state", "unchecked");
 
@@ -866,9 +853,9 @@ test("the mention Options controls are reachable and operable by keyboard", asyn
   // under test.
   await mainInput.fill("@Mor");
   await expect(list).toBeVisible();
-  const threadInput = threadComposer(page).getByTestId("message-input");
-  await threadInput.focus();
-  await expect(threadInput).toBeFocused();
+  const rootInput = channelComposer(page).getByTestId("message-input");
+  await rootInput.focus();
+  await expect(rootInput).toBeFocused();
   await expect(list).toHaveCount(0);
 });
 
@@ -907,9 +894,9 @@ test("a manual mention persists when automatic mentions are enabled", async ({
 }) => {
   await keepMentionedAgentsPinned(page);
   await installAudienceFixtures(page, { sendMessageDelayMs: 1_500 });
-  await openGeneral(page);
+  await openThread(page);
 
-  const composer = channelComposer(page);
+  const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
   await input.fill("@Mor");
   await expect(composer.getByTestId("mention-autocomplete")).toBeVisible();
@@ -928,7 +915,7 @@ test("a manual mention persists when automatic mentions are enabled", async ({
   await expect(autoPinConfirmation).not.toContainText(
     "Future messages in this channel will include this agent.",
   );
-  await expect(autoPinConfirmation).toHaveAttribute("data-side", "right");
+  await expect(autoPinConfirmation).toHaveAttribute("data-side", "left");
   await expect(autoPinConfirmation.locator("span")).toHaveCSS(
     "white-space",
     "nowrap",
@@ -948,8 +935,8 @@ test("a manual mention persists when automatic mentions are enabled", async ({
   if (!addressControlBox || !confirmationBox) {
     throw new Error("Automatic mention confirmation is not laid out");
   }
-  expect(confirmationBox.x).toBeGreaterThan(
-    addressControlBox.x + addressControlBox.width,
+  expect(confirmationBox.x + confirmationBox.width).toBeLessThanOrEqual(
+    addressControlBox.x,
   );
   const turnOffAction = autoPinConfirmation.getByRole("button", {
     name: "Turn off",
@@ -974,6 +961,9 @@ test("a manual mention persists when automatic mentions are enabled", async ({
     .poll(() => readOutgoingMentionPubkeys(page, "@Morgarita hello"))
     .toContain(AGENT_A);
 
+  await expect(input).toHaveAttribute("contenteditable", "true", {
+    timeout: 2_500,
+  });
   await input.fill("follow up");
   await expect(
     composer.getByTestId(`composer-address-lock-${AGENT_A}`),
@@ -989,9 +979,9 @@ test("the auto-pin popover can turn off automatic agent mentions", async ({
 }) => {
   await keepMentionedAgentsPinned(page);
   await installAudienceFixtures(page);
-  await openGeneral(page);
+  await openThread(page);
 
-  const composer = channelComposer(page);
+  const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
   await input.fill("@Mor");
   await expect(composer.getByTestId("mention-autocomplete")).toBeVisible();
@@ -1010,10 +1000,7 @@ test("the auto-pin popover can turn off automatic agent mentions", async ({
   await autoPinConfirmation.getByRole("button", { name: "Turn off" }).click();
 
   await expect(composer.getByTestId("mention-autocomplete")).toBeVisible();
-  await expect(composer.getByTestId("mention-options-trigger")).toHaveAttribute(
-    "aria-expanded",
-    "true",
-  );
+  await expect(composer.getByTestId("mention-options-settings")).toBeVisible();
   await expect(
     composer.getByTestId("mention-keep-agents-pinned-toggle"),
   ).toHaveAttribute("data-state", "unchecked");
@@ -1029,9 +1016,9 @@ test("the auto-pin popover can turn off automatic agent mentions", async ({
 test("the auto-pin popover remains open while hovered", async ({ page }) => {
   await keepMentionedAgentsPinned(page);
   await installAudienceFixtures(page);
-  await openGeneral(page);
+  await openThread(page);
 
-  const composer = channelComposer(page);
+  const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
   await input.fill("@Mor");
   await expect(composer.getByTestId("mention-autocomplete")).toBeVisible();
@@ -1053,9 +1040,9 @@ test("removing the mention chip dismisses the auto-pin popover", async ({
 }) => {
   await keepMentionedAgentsPinned(page);
   await installAudienceFixtures(page);
-  await openGeneral(page);
+  await openThread(page);
 
-  const composer = channelComposer(page);
+  const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
   await input.fill("@Mor");
   await expect(composer.getByTestId("mention-autocomplete")).toBeVisible();
@@ -1076,31 +1063,23 @@ test("removing the mention chip dismisses the auto-pin popover", async ({
   await expect(autoPinConfirmation).toHaveCount(0);
 });
 
-test("automatic mentions are scoped to their channel or thread composer", async ({
+test("automatic mentions exist only in thread composers and stay thread-scoped", async ({
   page,
 }) => {
   await installAudienceFixtures(page);
   await openGeneral(page);
-  await automaticallyMention(channelComposer(page), "Morgarita");
-  await expect(
-    channelComposer(page).getByTestId(`composer-address-lock-${AGENT_A}`),
-  ).toBeVisible();
 
-  await openThread(page);
+  const rootComposer = channelComposer(page);
+  await rootComposer.getByTestId("message-insert-mention").click();
   await expect(
-    threadComposer(page).getByTestId(`composer-address-lock-${AGENT_A}`),
+    rootComposer.getByTestId("mention-options-settings"),
+  ).toHaveCount(0);
+  await expect(
+    rootComposer.getByRole("button", { name: /^Automatically mention / }),
   ).toHaveCount(0);
 
+  await openThread(page);
   await automaticallyMention(threadComposer(page), "Vogue");
-  await openGeneral(page);
-  await expect(
-    channelComposer(page).getByTestId(`composer-address-lock-${AGENT_A}`),
-  ).toBeVisible();
-  await expect(
-    channelComposer(page).getByTestId(`composer-address-lock-${AGENT_B}`),
-  ).toHaveCount(0);
-
-  await openThread(page);
   await expect(
     threadComposer(page).getByTestId(`composer-address-lock-${AGENT_B}`),
   ).toBeVisible();
@@ -1111,72 +1090,47 @@ test("automatic mentions are scoped to their channel or thread composer", async 
   ).toHaveCount(0);
 });
 
-test("a thread automatic mention preserves an explicitly unpinned root agent", async ({
+test("a root agent mention is explicit for one message and never becomes retained", async ({
   page,
 }) => {
   await keepMentionedAgentsPinned(page);
   await installAudienceFixtures(page, { agentAName: "claude code" });
   await openGeneral(page);
 
-  const rootComposer = channelComposer(page);
-  const rootInput = rootComposer.getByTestId("message-input");
-  await automaticallyMention(rootComposer, "claude code");
+  const composer = channelComposer(page);
+  const input = composer.getByTestId("message-input");
+  const firstRootMessage = "@claude code one time";
+  await input.fill("@cla");
+  await expect(composer.getByTestId("mention-autocomplete")).toBeVisible();
+  await input.press("Tab");
+  await input.pressSequentially(" one time");
+  await expect(input).toHaveText(firstRootMessage);
   await expect(
-    rootComposer.getByTestId(`composer-address-lock-${AGENT_A}`),
-  ).toBeVisible();
-  await rootComposer
-    .getByTestId(`composer-address-lock-remove-${AGENT_A}`)
-    .click();
-  await expect(rootInput).toHaveText("");
-  await expect(
-    rootComposer.getByTestId(`composer-address-lock-${AGENT_A}`),
+    composer.getByTestId(`composer-address-lock-${AGENT_A}`),
   ).toHaveCount(0);
+  await input.press("Enter");
 
-  await rootInput.fill("@cla");
-  await expect(rootComposer.getByTestId("mention-autocomplete")).toBeVisible();
-  await rootInput.press("Tab");
-  await rootInput.type("one time");
-  await rootInput.press("Enter");
-  await expect(rootInput).toHaveText("");
-  await expect(
-    rootComposer.getByTestId(`composer-address-lock-${AGENT_A}`),
-  ).toHaveCount(0);
-
-  await openThread(page);
-  const activeThreadComposer = threadComposer(page);
-  const threadInput = activeThreadComposer.getByTestId("message-input");
-  await threadInput.fill("@cla");
-  await expect(
-    activeThreadComposer.getByTestId("mention-autocomplete"),
-  ).toBeVisible();
-  await threadInput.press("Tab");
-  await expect(
-    activeThreadComposer.getByTestId(`composer-address-lock-${AGENT_A}`),
-  ).toBeVisible();
-  await threadInput.type("thread message");
-  await threadInput.press("Enter");
-
-  await openGeneral(page);
-  await expect(
-    channelComposer(page).getByTestId(`composer-address-lock-${AGENT_A}`),
-  ).toHaveCount(0);
-
-  const restoredRootInput = channelComposer(page).getByTestId("message-input");
-  await restoredRootInput.fill("@cla");
-  await expect(
-    channelComposer(page).getByTestId("mention-autocomplete"),
-  ).toBeVisible();
-  await restoredRootInput.press("Tab");
-  await expect(
-    channelComposer(page).getByTestId(`composer-address-lock-${AGENT_A}`),
-  ).toHaveCount(0);
-  await restoredRootInput.type("one time");
-  await restoredRootInput.press("Enter");
-
-  await expect(restoredRootInput).toHaveText("");
-  await expect(
-    channelComposer(page).getByTestId(`composer-address-lock-${AGENT_A}`),
-  ).toHaveCount(0);
+  await expect(input).toHaveText("");
+  await expect
+    .poll(() =>
+      page.evaluate(
+        (pubkey) =>
+          Boolean(
+            window.__BUZZ_E2E_SIGNED_EVENTS__?.some((event) =>
+              (event.tags ?? []).some(
+                (tag) => tag[0] === "p" && tag[1] === pubkey,
+              ),
+            ),
+          ),
+        AGENT_A,
+      ),
+    )
+    .toBe(true);
+  await input.fill("next root message");
+  await input.press("Enter");
+  await expect
+    .poll(() => readOutgoingMentionPubkeys(page, "next root message"))
+    .toEqual([]);
 });
 
 test("an unchecked agent remains excluded while automatic mentions stay enabled", async ({
@@ -1184,10 +1138,10 @@ test("an unchecked agent remains excluded while automatic mentions stay enabled"
 }) => {
   await keepMentionedAgentsPinned(page);
   await installAudienceFixtures(page);
-  await openGeneral(page);
-  await automaticallyMention(channelComposer(page), "Morgarita");
+  await openThread(page);
+  await automaticallyMention(threadComposer(page), "Morgarita");
 
-  const composer = channelComposer(page);
+  const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
   await composer.getByTestId(`composer-address-lock-remove-${AGENT_A}`).click();
   await expect(input).toHaveText("");
@@ -1208,9 +1162,9 @@ test("re-adding a deleted automatic mention restores its automatic mention state
 }) => {
   await keepMentionedAgentsPinned(page);
   await installAudienceFixtures(page);
-  await openGeneral(page);
+  await openThread(page);
 
-  const composer = channelComposer(page);
+  const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
   await automaticallyMention(composer, "Morgarita");
 
@@ -1246,13 +1200,13 @@ test("implicit automatic mentions stay out of persisted drafts", async ({
   page,
 }) => {
   await installAudienceFixtures(page);
-  await openGeneral(page);
-  await automaticallyMention(channelComposer(page), "Morgarita");
-  const input = channelComposer(page).getByTestId("message-input");
+  await openThread(page);
+  await automaticallyMention(threadComposer(page), "Morgarita");
+  const input = threadComposer(page).getByTestId("message-input");
   await input.type("draft text");
 
-  await openThread(page);
   await openGeneral(page);
+  await openThread(page);
 
   await expect(input).toHaveText("@Morgarita draft text");
   await expect(input.locator(".agent-mention-highlight")).toHaveCount(1);
@@ -1266,19 +1220,7 @@ test("implicit automatic mentions stay out of persisted drafts", async ({
   await expect(page.getByTestId("chat-title")).toHaveText("random");
 
   await expect
-    .poll(() =>
-      page.evaluate((channelId) => {
-        for (const storageKey of Object.keys(window.localStorage)) {
-          if (!storageKey.startsWith("buzz-drafts.v2:")) continue;
-          const drafts = JSON.parse(
-            window.localStorage.getItem(storageKey) ?? "{}",
-          ) as Record<string, { channelId?: string; content?: string }>;
-          const draft = drafts[channelId];
-          if (draft?.channelId === channelId) return draft.content ?? "";
-        }
-        return "";
-      }, CHANNEL_ID),
-    )
+    .poll(() => readPersistedDraftContent(page, `thread:${THREAD_ROOT_ID}`))
     .toBe("draft text continues");
 });
 
@@ -1286,37 +1228,23 @@ test("an authored duplicate leading mention survives draft restoration", async (
   page,
 }) => {
   await installAudienceFixtures(page);
-  await openGeneral(page);
-  await automaticallyMention(channelComposer(page), "Morgarita");
-  const input = channelComposer(page).getByTestId("message-input");
+  await openThread(page);
+  await automaticallyMention(threadComposer(page), "Morgarita");
+  const input = threadComposer(page).getByTestId("message-input");
   await input.pressSequentially("@Morgarita authored duplicate");
 
-  await openThread(page);
   await openGeneral(page);
+  await openThread(page);
 
-  await expect(input).toHaveText("@Morgarita @Morgarita authored duplicate");
-  // Exact typed mentions now resolve on Space, so both the automatic prefix and
-  // the authored duplicate retain mention identity after restoration.
-  await expect(input.locator(".agent-mention-highlight")).toHaveCount(2);
+  await expect(input).toHaveText("@Morgarita authored duplicate");
+  await expect(input.locator(".agent-mention-highlight")).toHaveCount(1);
 
   await page.goto(`/#/channels/${RANDOM_CHANNEL_ID}`, {
     waitUntil: "domcontentloaded",
   });
   await expect(page.getByTestId("chat-title")).toHaveText("random");
   await expect
-    .poll(() =>
-      page.evaluate((channelId) => {
-        for (const storageKey of Object.keys(window.localStorage)) {
-          if (!storageKey.startsWith("buzz-drafts.v2:")) continue;
-          const drafts = JSON.parse(
-            window.localStorage.getItem(storageKey) ?? "{}",
-          ) as Record<string, { channelId?: string; content?: string }>;
-          const draft = drafts[channelId];
-          if (draft?.channelId === channelId) return draft.content ?? "";
-        }
-        return "";
-      }, CHANNEL_ID),
-    )
+    .poll(() => readPersistedDraftContent(page, `thread:${THREAD_ROOT_ID}`))
     .toBe("@Morgarita authored duplicate");
 });
 
@@ -1324,8 +1252,8 @@ test("typed deletion preserves an identical authored mention in drafts", async (
   page,
 }) => {
   await installAudienceFixtures(page);
-  await openGeneral(page);
-  const composer = channelComposer(page);
+  await openThread(page);
+  const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
   await automaticallyMention(composer, "Morgarita");
 
@@ -1344,20 +1272,7 @@ test("typed deletion preserves an identical authored mention in drafts", async (
     waitUntil: "domcontentloaded",
   });
   await expect
-    .poll(() =>
-      page.evaluate((channelId) => {
-        for (const storageKey of Object.keys(window.localStorage)) {
-          if (!storageKey.startsWith("buzz-drafts.v2:")) continue;
-          const draft = (
-            JSON.parse(
-              window.localStorage.getItem(storageKey) ?? "{}",
-            ) as Record<string, { content?: string }>
-          )[channelId];
-          if (draft) return draft.content ?? "";
-        }
-        return "";
-      }, CHANNEL_ID),
-    )
+    .poll(() => readPersistedDraftContent(page, `thread:${THREAD_ROOT_ID}`))
     .toBe("@Morgarita manual after typed deletion");
 });
 
@@ -1365,8 +1280,8 @@ test("removing an automatic mention preserves an identical authored mention in d
   page,
 }) => {
   await installAudienceFixtures(page);
-  await openGeneral(page);
-  const composer = channelComposer(page);
+  await openThread(page);
+  const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
 
   await automaticallyMention(composer, "Morgarita");
@@ -1377,20 +1292,7 @@ test("removing an automatic mention preserves an identical authored mention in d
   });
 
   await expect
-    .poll(() =>
-      page.evaluate((channelId) => {
-        for (const storageKey of Object.keys(window.localStorage)) {
-          if (!storageKey.startsWith("buzz-drafts.v2:")) continue;
-          const draft = (
-            JSON.parse(
-              window.localStorage.getItem(storageKey) ?? "{}",
-            ) as Record<string, { content?: string }>
-          )[channelId];
-          if (draft) return draft.content ?? "";
-        }
-        return "";
-      }, CHANNEL_ID),
-    )
+    .poll(() => readPersistedDraftContent(page, `thread:${THREAD_ROOT_ID}`))
     .toBe("@Morgarita manual after removal");
 });
 
@@ -1398,35 +1300,22 @@ test("multiple automatic mentions stay out of persisted drafts", async ({
   page,
 }) => {
   await installAudienceFixtures(page);
-  await openGeneral(page);
-  const composer = channelComposer(page);
+  await openThread(page);
+  const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
   await automaticallyMention(composer, "Morgarita");
   await automaticallyMention(composer, "Vogue");
   await input.pressSequentially("draft text");
 
-  await openThread(page);
   await openGeneral(page);
-  await expect(input).toHaveText("@Vogue @Morgarita draft text");
+  await openThread(page);
+  await expect(input).toHaveText("@Morgarita @Vogue draft text");
   await expect(input.locator(".agent-mention-highlight")).toHaveCount(2);
   await page.goto(`/#/channels/${RANDOM_CHANNEL_ID}`, {
     waitUntil: "domcontentloaded",
   });
   await expect
-    .poll(() =>
-      page.evaluate((channelId) => {
-        for (const storageKey of Object.keys(window.localStorage)) {
-          if (!storageKey.startsWith("buzz-drafts.v2:")) continue;
-          const draft = (
-            JSON.parse(
-              window.localStorage.getItem(storageKey) ?? "{}",
-            ) as Record<string, { content?: string }>
-          )[channelId];
-          if (draft) return draft.content ?? "";
-        }
-        return "";
-      }, CHANNEL_ID),
-    )
+    .poll(() => readPersistedDraftContent(page, `thread:${THREAD_ROOT_ID}`))
     .toBe("draft text");
 });
 
@@ -1434,8 +1323,8 @@ test("re-enabling an automatic mention preserves an authored duplicate after dra
   page,
 }) => {
   await installAudienceFixtures(page);
-  await openGeneral(page);
-  const composer = channelComposer(page);
+  await openThread(page);
+  const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
 
   await automaticallyMention(composer, "Morgarita");
@@ -1444,30 +1333,18 @@ test("re-enabling an automatic mention preserves an authored duplicate after dra
 
   await automaticallyMention(composer, "Morgarita");
   await input.pressSequentially("@Morgarita authored duplicate");
-  await openThread(page);
   await openGeneral(page);
+  await openThread(page);
 
-  await expect(input).toHaveText("@Morgarita @Morgarita authored duplicate");
-  await expect(input.locator(".agent-mention-highlight")).toHaveCount(2);
+  await expect(input).toHaveText("@Morgarita authored duplicate");
+  await expect(input.locator(".agent-mention-highlight")).toHaveCount(1);
 
   await page.goto(`/#/channels/${RANDOM_CHANNEL_ID}`, {
     waitUntil: "domcontentloaded",
   });
   await expect(page.getByTestId("chat-title")).toHaveText("random");
   await expect
-    .poll(() =>
-      page.evaluate((channelId) => {
-        for (const storageKey of Object.keys(window.localStorage)) {
-          if (!storageKey.startsWith("buzz-drafts.v2:")) continue;
-          const drafts = JSON.parse(
-            window.localStorage.getItem(storageKey) ?? "{}",
-          ) as Record<string, { channelId?: string; content?: string }>;
-          const draft = drafts[channelId];
-          if (draft?.channelId === channelId) return draft.content ?? "";
-        }
-        return "";
-      }, CHANNEL_ID),
-    )
+    .poll(() => readPersistedDraftContent(page, `thread:${THREAD_ROOT_ID}`))
     .toBe("@Morgarita authored duplicate");
 });
 
@@ -1475,8 +1352,8 @@ test("a restored multi-word automatic mention remains a chip with the caret afte
   page,
 }) => {
   await installAudienceFixtures(page, { agentAName: "claude code" });
-  await openGeneral(page);
-  const originalComposer = channelComposer(page);
+  await openThread(page);
+  const originalComposer = threadComposer(page);
   await automaticallyMention(originalComposer, "claude code");
   const originalInput = originalComposer.getByTestId("message-input");
   await originalInput.pressSequentially("hello");
@@ -1490,9 +1367,9 @@ test("a restored multi-word automatic mention remains a chip with the caret afte
     waitUntil: "domcontentloaded",
   });
   await expect(page.getByTestId("chat-title")).toHaveText("random");
-  await openGeneral(page);
+  await openThread(page);
 
-  const composer = channelComposer(page);
+  const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
   const expectedContent = "@claude code ";
   await expect(input).toHaveText(expectedContent);
@@ -1501,7 +1378,7 @@ test("a restored multi-word automatic mention remains a chip with the caret afte
     composer.getByTestId(`composer-address-lock-${AGENT_A}`),
   ).toBeVisible();
   await expect(
-    composer.getByRole("button", { name: "Manage automatic agent mentions" }),
+    composer.getByRole("button", { name: "Manage mentions" }),
   ).toBeVisible();
   await page.waitForTimeout(500);
   await expect(input.locator(".agent-mention-highlight")).toHaveCount(1);
@@ -1524,9 +1401,9 @@ test("reduced motion removes addressed agents without spatial animation", async 
   await page.emulateMedia({ reducedMotion: "reduce" });
   await keepMentionedAgentsPinned(page);
   await installAudienceFixtures(page);
-  await openGeneral(page);
+  await openThread(page);
 
-  const composer = channelComposer(page);
+  const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
   await input.fill("@Mor");
   await expect(composer.getByTestId("mention-autocomplete")).toBeVisible();
@@ -1572,7 +1449,7 @@ test("the mention-button placement fits the narrow composer", async ({
   await automaticallyMention(overlay, "Vogue");
   await expect(overlay.getByTestId("composer-address-locks")).toBeVisible();
   await expect(
-    overlay.getByRole("button", { name: "Manage automatic agent mentions" }),
+    overlay.getByRole("button", { name: "Manage mentions" }),
   ).toBeVisible();
   await waitForAnimations(page);
   await composer.screenshot({ path: `${SHOTS}/narrow-mention-button.png` });
@@ -1581,9 +1458,9 @@ test("the mention-button placement fits the narrow composer", async ({
 test("captures the lightweight auto-pin popover", async ({ page }) => {
   await seedTheme(page, "buzz-dark");
   await installAudienceFixtures(page);
-  await openGeneral(page);
+  await openThread(page);
 
-  const composer = channelComposer(page);
+  const composer = threadComposer(page);
   const input = composer.getByTestId("message-input");
   await input.fill("draft text");
   await pressPrimaryShiftM(page);
