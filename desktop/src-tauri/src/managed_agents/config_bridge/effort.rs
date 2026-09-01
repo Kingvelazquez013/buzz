@@ -268,7 +268,7 @@ pub(crate) fn strip_effort_keys_from_command(cmd: &mut std::process::Command) {
     }
 }
 
-/// Strip every known effort key and emit the projected effort value to a
+/// Strip effort keys and emit the projected effort value to a
 /// [`std::process::Command`].
 ///
 /// This is the production command-boundary seam: call after
@@ -279,15 +279,37 @@ pub(crate) fn strip_effort_keys_from_command(cmd: &mut std::process::Command) {
 /// environment, making the test fail if either step is removed or misordered
 /// in production.
 ///
-/// - Strip: removes all suppress-set keys (canonical + lowercase variant) so
-///   no ambient inherited or baked key shadows the projected authority.
-/// - Emit: writes exactly one projected key+value when `launch.value` is
-///   `Some`; emits nothing on `None` (no effort for this spawn).
+/// Strip policy follows `launch.suppress`: for known runtimes that is the full
+/// effort vocabulary; for unknown/custom runtimes it is only the ACP sentinel,
+/// leaving foreign effort keys (e.g. a wrapper's own `GOOSE_THINKING_EFFORT`)
+/// untouched. Each key is stripped in canonical and lowercase form so ambient
+/// inherited env with non-canonical casing is swept on Unix.
+///
+/// When `launch.preserve_passthrough` is set and `launch.value` is `None`
+/// (unknown runtime, no authoritative column), the suppress set is skipped
+/// entirely: the inherited process env carries the user's hand-set sentinel,
+/// and stripping it here without a re-emit would silently drop it. Known
+/// runtimes always have a resolved `value` or do not set `preserve_passthrough`.
 pub(crate) fn apply_effort_launch_to_command(
     cmd: &mut std::process::Command,
     launch: &EffortLaunch,
 ) {
-    strip_effort_keys_from_command(cmd);
+    // For unknown/custom runtimes with no resolved value the suppress set is
+    // only the ACP sentinel, and stripping it without re-emitting would destroy
+    // the user's ambient pass-through config. Skip the strip entirely and let
+    // the inherited env carry it through unchanged.
+    // MUTATION: removing this guard strips the sentinel and breaks
+    // `production_sequence_custom_inherited_acp_sentinel_survives`.
+    if launch.preserve_passthrough && launch.value.is_none() {
+        return;
+    }
+    for key in &launch.suppress {
+        cmd.env_remove(key);
+        let lower = key.to_ascii_lowercase();
+        if lower.as_str() != *key {
+            cmd.env_remove(&lower);
+        }
+    }
     if let Some(ref value) = launch.value {
         cmd.env(launch.key, value);
     }
@@ -464,32 +486,25 @@ fn resolve_effective_effort(
     None
 }
 
-/// Combined projection + strip + emit seam for a spawn.
+/// Combined spawn seam: baked-env write + effort strip + emit.
 ///
-/// Called by `runtime.rs` immediately before launching an agent child and by
-/// the production-sequence tests so that deleting this call from either
-/// location fails the child-env assertions. Tests that call this function
-/// enter the SAME seam production uses — removing the `effort_launch_projection`
-/// call or the `apply_effort_launch_to_command` call inside fails them.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_effort_sequence_to_command(
+/// Both `runtime.rs` (`spawn_agent_child`) and the production-sequence tests call
+/// this function, so deleting `build_buzz_agent_provider_defaults` or
+/// `apply_effort_launch_to_command` inside is caught by the tests. The outer
+/// invocation from `spawn_agent_child` is not unit-testable without Tauri
+/// infrastructure and is therefore not covered at this level.
+pub(crate) fn apply_spawn_effort_env(
     cmd: &mut std::process::Command,
     record: &ManagedAgentRecord,
     runtime: Option<&KnownAcpRuntime>,
     personas: &[AgentDefinition],
     persona_id: Option<&str>,
     global_env: &BTreeMap<String, String>,
-    harness_def: Option<&HarnessDefinition>,
     baked_env: &BTreeMap<String, String>,
 ) {
+    crate::managed_agents::agent_env::build_buzz_agent_provider_defaults(cmd);
     let launch = effort_launch_projection(
-        record,
-        runtime,
-        personas,
-        persona_id,
-        global_env,
-        harness_def,
-        baked_env,
+        record, runtime, personas, persona_id, global_env, None, baked_env,
     );
     apply_effort_launch_to_command(cmd, &launch);
 }

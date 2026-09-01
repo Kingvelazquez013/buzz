@@ -52,17 +52,8 @@ fn ensure_effort_change_supported(
     Ok(())
 }
 
-/// Guard/apply seam for the effort step of `update_managed_agent`.
-///
-/// Called at line ~273 of `update_managed_agent` so tests enter the same
-/// function as production. Guards non-local records, then delegates to
-/// `apply_picker_effort_level` for local records when a value is present.
-/// Absent `effort_level` (`None` outer) is a no-op.
-///
-/// Mutation proofs (see `agent_models_update_tests.rs`):
-///   - Deleting `ensure_effort_change_supported` makes reject tests pass `Ok(())`.
-///   - Deleting `apply_picker_effort_level` leaves `effort_level == None` on set.
-pub(crate) fn apply_effort_update(
+/// Guard/apply seam for the effort step inside `apply_record_field_updates`.
+fn apply_effort_update(
     record: &mut ManagedAgentRecord,
     effort_level: Option<Option<String>>,
 ) -> Result<(), String> {
@@ -70,6 +61,37 @@ pub(crate) fn apply_effort_update(
     if let Some(effort_override) = effort_level {
         crate::commands::agent_config::apply_picker_effort_level(record, effort_override);
     }
+    Ok(())
+}
+
+/// Apply the env-vars and effort steps of `update_managed_agent` to a record
+/// in the correct order: env_vars FIRST (so the same-request map cannot
+/// reintroduce a stale alias), then the canonical effort column write.
+///
+/// Called by `update_managed_agent` inside its locked transaction and by tests.
+/// Any step deleted from inside this function is directly caught by the
+/// corresponding test assertion.
+///
+/// Mutation proofs (see `agent_models_update_tests.rs`):
+///   - Deleting the `apply_effort_update` call leaves `effort_level` unchanged.
+///   - Deleting `ensure_effort_change_supported` inside `apply_effort_update`
+///     lets non-local writes pass `Ok(())` without mutating the column.
+///   - Deleting `apply_picker_effort_level` inside `apply_effort_update`
+///     leaves `effort_level == None` on a local-set request.
+pub(crate) fn apply_record_field_updates(
+    record: &mut ManagedAgentRecord,
+    env_vars: Option<&std::collections::BTreeMap<String, String>>,
+    inherit_transition: bool,
+    effort_level: Option<Option<String>>,
+) -> Result<(), String> {
+    // Order is load-bearing: env_vars before effort so a same-request
+    // env_vars map cannot reintroduce a stale alias after the column write.
+    crate::managed_agents::apply_env_vars_then_effort_transition(
+        record,
+        env_vars.cloned(),
+        inherit_transition,
+    );
+    apply_effort_update(record, effort_level)?;
     Ok(())
 }
 
@@ -187,11 +209,6 @@ pub async fn update_managed_agent(
         if let Some(ref env_vars) = input.env_vars {
             crate::managed_agents::validate_user_env_keys(env_vars)?;
         }
-        crate::managed_agents::apply_env_vars_then_effort_transition(
-            record,
-            input.env_vars,
-            inherit_transition,
-        );
 
         // Native provider/model fields are authoritative. Keep the typed marker
         // derived for new records while retaining legacy typed records for
@@ -263,13 +280,18 @@ pub async fn update_managed_agent(
             record.respond_to_allowlist = prospective_allowlist;
         }
 
-        // Effort: persist inside the locked transaction so an access-policy
-        // restart (above) snapshots and launches the new effort value, not the
-        // old one. Present + Some(value) = set; Present + None = clear.
-        // Absent = don't touch (the dialog sends it only when effortTouched).
-        // Uses the same alias-sweep applied inside apply_picker_effort_level so
-        // no stale record-scope alias outranks the just-written column.
-        apply_effort_update(record, input.effort_level)?;
+        // Effort + env_vars: applied together inside `apply_record_field_updates` to
+        // enforce the ordering invariant (env_vars before effort column write) and
+        // provide a directly-testable production seam. Effort persists inside the
+        // locked transaction so an access-policy restart above snapshots and
+        // launches the new effort value. Present+Some(v)=set; Present+None=clear;
+        // Absent=don't touch (the dialog sends it only when effortTouched).
+        apply_record_field_updates(
+            record,
+            input.env_vars.as_ref(),
+            inherit_transition,
+            input.effort_level,
+        )?;
 
         record.updated_at = now_iso();
 

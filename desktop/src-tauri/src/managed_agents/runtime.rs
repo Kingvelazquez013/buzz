@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use tauri::AppHandle;
 
-use super::agent_env::{build_buzz_agent_provider_defaults, idle_pool_sleep_env};
+use super::agent_env::idle_pool_sleep_env;
 
 use crate::{
     managed_agents::{
@@ -741,19 +741,15 @@ pub fn spawn_agent_child(
         &mut command,
         resolve_session_title(record.display_name.as_deref(), &record.name),
     );
-    build_buzz_agent_provider_defaults(&mut command);
     // Strip all known effort keys and emit exactly one projected key. `Command`
     // inherits the parent env — an ambient effort key would leave two authorities.
-    // `apply_effort_sequence_to_command` (combines projection + strip + emit) is
-    // the seam the production-sequence tests enter; deleting it fails those tests.
-    super::config_bridge::effort::apply_effort_sequence_to_command(
+    super::config_bridge::effort::apply_spawn_effort_env(
         &mut command,
         record,
         runtime_meta,
         &personas,
         record.persona_id.as_deref(),
         &global.env_vars,
-        None,
         &super::agent_env::baked_build_env(),
     );
     if let Some(meta) = runtime_meta {
@@ -823,9 +819,6 @@ pub fn spawn_agent_child(
         command.env(key, value);
     }
     crate::build_identity::apply_demo_config_home(&mut command)?;
-
-    // Effort authority: `apply_effort_launch_to_command` above already emitted the
-    // projected key; `descriptor.env` re-writes the same value (no double authority).
 
     // A1: for local claude agents, ANTHROPIC_MODEL is the single startup model authority.
     // BUZZ_ACP_MODEL is removed (live ACP switches only; two authorities in the same env

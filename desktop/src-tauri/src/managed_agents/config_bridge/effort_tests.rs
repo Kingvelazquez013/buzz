@@ -1,25 +1,13 @@
 //! Parity matrix for the single harness-agnostic effort projection
 //! (`effort_launch_projection`, PR #4625).
 //!
-//! Every spawn path — local (`runtime.rs`), remote deploy (`agents_deploy.rs`),
-//! and restart snapshot (`spawn_snapshot.rs`) — consumes this one projection via
-//! `descriptor.env`, so these tests are the authority contract for all three.
-//! They pin, per runtime strategy:
-//!
-//!   * the CLEAR authority order (record native > canonical column > record
-//!     legacy > persona > global > definition > baked);
-//!   * the decisive mixed-authority case (valid record-native + a different
-//!     valid column → the native value wins everywhere);
-//!   * `value == None` when no tier expresses a value the destination accepts;
-//!   * single-key emission + full-suppress on `apply`;
-//!   * the unknown/custom-runtime ACP-sentinel fallback.
+//! Covers, per runtime: CLEAR authority order; decisive mixed-authority;
+//! `value == None` when no tier resolves; single-key emission + suppress;
+//! unknown/custom-runtime ACP-sentinel fallback.
 
 use std::collections::BTreeMap;
 
-use super::{
-    apply_effort_sequence_to_command, effort_launch_projection, effort_suppress_keys, EffortLaunch,
-};
-use crate::managed_agents::agent_env::build_buzz_agent_provider_defaults;
+use super::{apply_spawn_effort_env, effort_launch_projection, effort_suppress_keys, EffortLaunch};
 use crate::managed_agents::custom_harnesses::HarnessDefinition;
 use crate::managed_agents::discovery::{known_acp_runtime_exact, KnownAcpRuntime};
 use crate::managed_agents::types::{AgentDefinition, ManagedAgentRecord};
@@ -405,12 +393,9 @@ fn suppress_covers_all_native_legacy_and_sentinel_keys() {
 
 #[test]
 fn apply_strips_every_foreign_effort_key_then_emits_one() {
-    // A launch env carrying multiple stale/foreign effort keys must end with
-    // exactly the one destination key holding the projected value.
     let mut r = record();
     r.effort_level = Some("high".into());
     let launch = project_record_only(&r, Some(goose()));
-
     let mut launch_env = env(&[
         (ACP_KEY, "stale"),
         (BUZZ_AGENT_KEY, "stale"),
@@ -418,7 +403,6 @@ fn apply_strips_every_foreign_effort_key_then_emits_one() {
         ("UNRELATED", "keep"),
     ]);
     launch.apply(&mut launch_env);
-
     assert_eq!(launch_env.get(GOOSE_KEY).map(String::as_str), Some("high"));
     assert_eq!(launch_env.get(ACP_KEY), None);
     assert_eq!(launch_env.get(BUZZ_AGENT_KEY), None);
@@ -435,8 +419,6 @@ fn apply_strips_every_foreign_effort_key_then_emits_one() {
 
 #[test]
 fn apply_with_no_value_strips_all_effort_keys() {
-    // value == None → strip every effort key and emit nothing (valid passthrough
-    // does not survive because the projection already resolved all tiers).
     let launch = project_record_only(&record(), Some(goose()));
     assert_eq!(launch.value, None);
     let mut launch_env = env(&[(ACP_KEY, "x"), (GOOSE_KEY, "y")]);
@@ -451,14 +433,10 @@ fn apply_with_no_value_strips_all_effort_keys() {
 
 #[test]
 fn buzz_agent_generic_column_does_not_leak_acp_sentinel() {
-    // A buzz-agent descriptor carrying the generic ACP sentinel in user env must
-    // launch with only its native key — the sentinel is suppressed as transport.
     let mut r = record();
     r.env_vars = env(&[(ACP_KEY, "high")]);
     r.effort_level = Some("medium".into());
     let launch = project_record_only(&r, Some(buzz_agent()));
-    // buzz-agent's native key is BUZZ_AGENT_THINKING_EFFORT; the ACP sentinel is
-    // not its native tier, so the column wins and emits under the native key.
     assert_eq!(launch.value.as_deref(), Some("medium"));
     assert_eq!(launch.key, BUZZ_AGENT_KEY);
 
@@ -482,11 +460,8 @@ fn buzz_agent_generic_column_does_not_leak_acp_sentinel() {
 #[test]
 fn unknown_runtime_does_not_suppress_user_effort_env() {
     // Regression: a custom wrapper with GOOSE_THINKING_EFFORT=high in record env
-    // must receive it unchanged. On main an unset column left env untouched; the
-    // projection must not strip a foreign effort key for a runtime it has no
-    // metadata for. Only our own ACP-startup sentinel is reconciled (external
-    // review, Carl P2), so `suppress` is exactly `[BUZZ_ACP_EFFORT_LEVEL]` — no
-    // foreign key.
+    // must reach the child unchanged. For unknown runtimes `suppress` is exactly
+    // `[BUZZ_ACP_EFFORT_LEVEL]` — no foreign effort key is stripped.
     let mut r = record();
     r.env_vars = env(&[(GOOSE_KEY, "high"), ("UNRELATED", "keep")]);
     let launch = project_record_only(&r, None);
@@ -511,13 +486,10 @@ fn unknown_runtime_does_not_suppress_user_effort_env() {
 
 #[test]
 fn unknown_runtime_keeps_user_acp_sentinel_when_no_column() {
-    // A custom adapter with a hand-set BUZZ_ACP_EFFORT_LEVEL and no canonical
-    // column keeps its sentinel value: nothing to project, but the pass-through
-    // is preserved and re-emitted canonically so the child still receives it.
+    // Custom adapter with hand-set sentinel and no column: sentinel carries through.
     let mut r = record();
     r.env_vars = env(&[(ACP_KEY, "low")]);
     let launch = project_record_only(&r, None);
-    // No column → no projected value; the sentinel is carried through `apply`.
     assert_eq!(launch.value, None);
     assert!(launch.preserve_passthrough);
     let mut launch_env = r.env_vars.clone();
@@ -531,12 +503,9 @@ fn unknown_runtime_keeps_user_acp_sentinel_when_no_column() {
 
 #[test]
 fn unknown_runtime_collapses_mixed_case_sentinel_to_canonical_when_no_column() {
-    // External review, Carl P2 (no-column half): a hand-set MIXED-CASE sentinel
-    // on a custom runtime must survive AND be normalized to the canonical
-    // spelling. Windows `Command` case-folds env names, so leaving the lowercase
-    // variant would hand the child a value the exact-case snapshot read misses.
-    // After the projection exactly one canonical spelling remains, carrying the
-    // pass-through value — so child, snapshot, and badge cannot disagree on case.
+    // Carl P2 (no-column): a hand-set mixed-case sentinel on a custom runtime
+    // must survive AND be re-emitted under the canonical spelling. Leaving the
+    // lowercase variant would hand the child a value the snapshot read misses.
     let mut r = record();
     r.env_vars = env(&[("buzz_acp_effort_level", "low")]);
     let launch = project_record_only(&r, None);
@@ -546,25 +515,22 @@ fn unknown_runtime_collapses_mixed_case_sentinel_to_canonical_when_no_column() {
     assert_eq!(
         launch_env.get(ACP_KEY).map(String::as_str),
         Some("low"),
-        "the mixed-case pass-through sentinel is re-emitted under the canonical key"
+        "mixed-case pass-through sentinel re-emitted under canonical key"
     );
     assert_eq!(
         launch_env.get("buzz_acp_effort_level"),
         None,
-        "the mixed-case spelling is collapsed away, leaving exactly one sentinel"
+        "mixed-case spelling is collapsed away"
     );
 }
 
 #[test]
 fn unknown_runtime_no_column_multi_variant_preserves_windows_effective_value() {
     // Pass-3 IMPORTANT (Thufir): both case spellings of the sentinel survive the
-    // case-sensitive layer merge — a lower-tier canonical `BUZZ_ACP_EFFORT_LEVEL`
-    // plus a higher-tier record override `buzz_acp_effort_level` — with NO column.
-    // The carry must preserve the value the Windows child would actually receive.
-    // Rust's `Command` writes each spelling in `BTreeMap` iteration order into a
-    // case-folded env map (last set wins); canonical `B` sorts before lowercase
-    // `b`, so the lowercase/higher-tier `low` is written last and wins. The carry
-    // selects the LAST case-insensitive match in iteration order, matching that.
+    // case-sensitive layer merge. Rust `Command` writes in `BTreeMap` iteration
+    // order into a case-folded env map (last set wins); canonical `B` sorts before
+    // lowercase `b`, so the lowercase `low` is written last and wins. The carry
+    // selects the LAST case-insensitive match, matching that.
     let mut r = record();
     r.env_vars = env(&[(ACP_KEY, "high"), ("buzz_acp_effort_level", "low")]);
     let launch = project_record_only(&r, None);
@@ -575,25 +541,16 @@ fn unknown_runtime_no_column_multi_variant_preserves_windows_effective_value() {
     assert_eq!(
         launch_env.get(ACP_KEY).map(String::as_str),
         Some("low"),
-        "the carry preserves the last-in-iteration-order value the Windows child receives"
+        "carry preserves the last-in-iteration-order value the Windows child receives"
     );
-    assert_eq!(
-        launch_env.get("buzz_acp_effort_level"),
-        None,
-        "every case variant collapses to exactly one canonical sentinel"
-    );
-    // Mutation: reverting the carry to exact-first `get_ci` selects canonical
-    // `high` instead, inverting the pass-through value and re-breaking this pin.
+    assert_eq!(launch_env.get("buzz_acp_effort_level"), None);
+    // Mutation: reverting the carry to exact-first `get_ci` selects `high`.
 }
 
 #[test]
 fn unknown_runtime_column_wins_over_mixed_case_sentinel() {
-    // External review, Carl P2 (with-column half): a canonical column plus a
-    // hand-set mixed-case sentinel. The column is the authority (the sentinel is
-    // transport for an unknown runtime), and the projection must strip EVERY case
-    // variant of the sentinel before emitting the column value — so the child
-    // receives the column value, not the shadowing lowercase variant Windows
-    // would otherwise fold onto the canonical key.
+    // Carl P2 (with-column): canonical column plus mixed-case sentinel. Column
+    // wins; the projection strips ALL case variants of the sentinel before emit.
     let mut r = record();
     r.effort_level = Some("high".into());
     r.env_vars = env(&[("buzz_acp_effort_level", "low")]);
@@ -605,16 +562,10 @@ fn unknown_runtime_column_wins_over_mixed_case_sentinel() {
     assert_eq!(
         launch_env.get(ACP_KEY).map(String::as_str),
         Some("high"),
-        "the column value wins and is emitted under the canonical sentinel key"
+        "column wins, emitted under canonical sentinel key"
     );
-    assert_eq!(
-        launch_env.get("buzz_acp_effort_level"),
-        None,
-        "the shadowing mixed-case sentinel is stripped so the column truly wins"
-    );
-    // Mutation: reverting the unknown-runtime suppress set to empty leaves
-    // `buzz_acp_effort_level=low` in the child env, so the column would NOT win
-    // on Windows and this case-variant assertion fails.
+    assert_eq!(launch_env.get("buzz_acp_effort_level"), None);
+    // Mutation: empty suppress set leaves `buzz_acp_effort_level=low` in child.
 }
 
 #[test]
@@ -703,13 +654,10 @@ fn mixed_case_native_key_is_read_and_wins() {
 
 #[test]
 fn duplicate_case_native_variants_resolve_to_windows_effective_value() {
-    // Carl P2 (r8): both case spellings of a known runtime's native key survive
-    // the case-sensitive record env map. Windows `Command` writes each spelling
-    // in `BTreeMap` iteration order into a case-folded env map, so the LAST-set
-    // spelling wins and is the value the child receives. Canonical
-    // `GOOSE_THINKING_EFFORT` sorts before lowercase `goose_thinking_effort`, so
-    // the lowercase `high` is written last and is the child's effective value.
-    // `get_ci` must select that last match, not the exact-case `low`.
+    // Carl P2 (r8): both case spellings of a known native key in the record env.
+    // Rust `Command` writes in `BTreeMap` order into a case-folded map; canonical
+    // `GOOSE_THINKING_EFFORT` sorts before lowercase, so the lowercase `high` is
+    // written last and wins. `get_ci` must select the LAST match, not exact-case.
     let mut r = record();
     r.env_vars = env(&[(GOOSE_KEY, "low"), ("goose_thinking_effort", "high")]);
     let launch = project_record_only(&r, Some(goose()));
@@ -718,8 +666,7 @@ fn duplicate_case_native_variants_resolve_to_windows_effective_value() {
         Some("high"),
         "known-runtime native lookup selects the last case variant Windows Command sets"
     );
-    // Mutation: reverting `get_ci` to exact-first selects the canonical `low`,
-    // inverting the effective effort and re-breaking this pin.
+    // Mutation: reverting `get_ci` to exact-first selects `low`.
 }
 
 #[test]
@@ -751,29 +698,23 @@ fn apply_strips_mixed_case_effort_keys() {
 // --------------------------------------------------------------------------
 // Command-boundary strip (P1: inherited + baked collision)
 // --------------------------------------------------------------------------
-// `get_envs()` returns `(key, None)` when `env_remove(key)` was called (vs.
-// absent when the key was never set). These tests confirm each collision source.
 
-/// ACP sentinel inherited/baked collision (P1 source 1): after strip, the key
-/// is registered for removal via `env_remove` (appears as `(key, None)` in
-/// `get_envs()`). Deleting the `env_remove(ACP_KEY)` call makes this test red.
+/// ACP sentinel baked/inherited collision: registered for removal after strip.
 #[test]
 fn strip_removes_baked_acp_sentinel_collision() {
     let mut cmd = std::process::Command::new("echo");
     cmd.env(ACP_KEY, "high");
     super::strip_effort_keys_from_command(&mut cmd);
-    // `get_envs()` returns (key, None) when `env_remove` was called.
     let removed = cmd
         .get_envs()
         .any(|(key, value)| key == ACP_KEY && value.is_none());
     assert!(
         removed,
-        "ACP sentinel must be registered for removal after strip (P1 source 1)"
+        "ACP sentinel must be registered for removal after strip"
     );
 }
 
-/// Baked `GOOSE_THINKING_EFFORT` collision (P1 source 2): `build_buzz_agent_provider_defaults`
-/// writes baked-env pairs before the strip; without `env_remove` the key survives to the child.
+/// Baked `GOOSE_THINKING_EFFORT` collision: stripped before descriptor overlay.
 #[test]
 fn strip_removes_baked_goose_native_key_collision() {
     let mut cmd = std::process::Command::new("echo");
@@ -784,12 +725,11 @@ fn strip_removes_baked_goose_native_key_collision() {
         .any(|(key, value)| key == GOOSE_KEY && value.is_none());
     assert!(
         removed,
-        "GOOSE_THINKING_EFFORT must be registered for removal after strip (P1 source 2)"
+        "GOOSE_THINKING_EFFORT must be registered for removal after strip"
     );
 }
 
-/// Baked `BUZZ_AGENT_THINKING_EFFORT` collision (P1 source 3): legacy alias key;
-/// must be stripped before the projected-key overlay.
+/// Baked `BUZZ_AGENT_THINKING_EFFORT` collision: legacy alias stripped.
 #[test]
 fn strip_removes_baked_buzz_agent_native_key_collision() {
     let mut cmd = std::process::Command::new("echo");
@@ -804,8 +744,7 @@ fn strip_removes_baked_buzz_agent_native_key_collision() {
     );
 }
 
-/// Lowercase inherited key (P1 source 4): `goose_thinking_effort` from a Unix shell export
-/// survives if only the canonical form is removed. Deleting `env_remove(&lower)` makes this red.
+/// Lowercase inherited key: both canonical and lowercase variants are stripped.
 #[test]
 fn strip_removes_lowercase_goose_key_inherited_from_shell() {
     let lower = GOOSE_KEY.to_ascii_lowercase();
@@ -817,12 +756,11 @@ fn strip_removes_lowercase_goose_key_inherited_from_shell() {
         .any(|(key, value)| key == lower.as_str() && value.is_none());
     assert!(
         removed,
-        "lowercase GOOSE_THINKING_EFFORT variant must be registered for removal (Windows/Unix inherited env)"
+        "lowercase GOOSE key must be registered for removal"
     );
 }
 
-/// Custom passthrough: unknown-runtime effort-looking keys must NOT be stripped.
-/// Stripped keys appear as `(key, None)` in `get_envs()`; untouched ones remain `Some`.
+/// Custom passthrough: non-suppress-set keys are not removed.
 #[test]
 fn strip_does_not_remove_unrelated_env_key() {
     let mut cmd = std::process::Command::new("echo");
@@ -837,23 +775,58 @@ fn strip_does_not_remove_unrelated_env_key() {
     );
 }
 
-// Production-sequence seam tests: call `apply_effort_sequence_to_command`
-// (the same fn `runtime.rs` calls) and spawn `/usr/bin/env` so the child's
-// actual env is the ground truth — not `Command::get_envs()` tombstones.
+// Production-sequence seam tests: spawn the child directly so its actual env
+// is the ground truth — not `Command::get_envs()` tombstones.
+// These call `apply_spawn_effort_env`, the same function `spawn_agent_child` uses.
+// Deletion proofs:
+//   - remove `build_buzz_agent_provider_defaults` inside → baked keys leak;
+//   - remove `effort_launch_projection` → suppress list is empty, keys leak;
+//   - remove `apply_effort_launch_to_command` → stale keys remain, assertion fails.
 //
-// Mutation proof: deleting `effort_launch_projection` from inside the wrapper
-// empties the suppress list and lets effort keys leak; deleting
-// `apply_effort_launch_to_command` leaves stale keys and breaks the
-// single-authority assertion. Inherited state is seeded via `std::env::set_var`
-// (not `cmd.env()` after `env_clear()`) under INHERITED_ENV_LOCK so parallel
-// tests see a consistent parent environment.
+// Inherited-state tests seed the parent env via `std::env::set_var` under
+// INHERITED_ENV_LOCK. The `EnvVarGuard` RAII type below restores the exact
+// prior value (including None) in its `Drop` impl, so panics do not leak
+// the seeded value into unrelated child-spawn tests.
 use std::sync::Mutex;
 static INHERITED_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII guard: snapshots a process-env variable on creation and restores the
+/// exact prior value (or removes it if it was absent) on `Drop`, even if the
+/// test panics before the guard is dropped explicitly.
+struct EnvVarGuard {
+    key: String,
+    prior: Option<String>,
+}
+impl EnvVarGuard {
+    fn set(key: &str, value: &str) -> Self {
+        let prior = std::env::var(key).ok();
+        // SAFETY: test-only, single-threaded within the INHERITED_ENV_LOCK critical section.
+        #[allow(deprecated)]
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self {
+            key: key.to_string(),
+            prior,
+        }
+    }
+}
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        #[allow(deprecated)]
+        unsafe {
+            match &self.prior {
+                Some(v) => std::env::set_var(&self.key, v),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+}
 
 fn run_env_cmd(cmd: &mut std::process::Command) -> String {
     let output = cmd
         .output()
-        .expect("/usr/bin/env must be executable on this host");
+        .expect("env-dump command must be executable on this host");
     assert!(
         output.status.success(),
         "env command failed: {:?}",
@@ -864,37 +837,38 @@ fn run_env_cmd(cmd: &mut std::process::Command) -> String {
 
 /// Seam test: after projection + strip + emit, the child sees exactly the
 /// projected Goose key with no collision. Inherited lowercase key is seeded
-/// through the real parent environment (std::env::set_var), not cmd.env().
-/// Deleting `apply_effort_sequence_to_command` from runtime.rs fails this test.
+/// through the real parent environment (EnvVarGuard), which restores the prior
+/// value on drop even if an assertion panics — no process-env leakage.
 #[test]
 #[cfg(not(target_os = "windows"))]
 fn production_sequence_goose_inherited_collision_resolved_in_child() {
     let lower = GOOSE_KEY.to_ascii_lowercase();
-    let _guard = INHERITED_ENV_LOCK.lock().unwrap();
-    // Seed the lowercase key in the parent env so the child inherits it.
-    std::env::set_var(&lower, "inherited-low");
+    let _lock = INHERITED_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Seed the lowercase key in the parent env; dropped (restored) when the
+    // guard goes out of scope, even on panic.
+    let _guard = EnvVarGuard::set(&lower, "inherited-low");
 
     let mut cmd = std::process::Command::new("/usr/bin/env");
-    build_buzz_agent_provider_defaults(&mut cmd);
+    // Simulate stale baked-env entries that the real build would set via
+    // build_buzz_agent_provider_defaults (called inside apply_spawn_effort_env).
+    // In OSS test builds build_buzz_agent_provider_defaults is a no-op, so
+    // we seed the values manually to exercise the strip/emit path.
     cmd.env(GOOSE_KEY, "baked-high");
     cmd.env(BUZZ_AGENT_KEY, "legacy-medium");
     cmd.env("MY_AGENT_CONFIG", "keep-me");
 
     let mut r = record();
     r.effort_level = Some("high".into());
-    apply_effort_sequence_to_command(
+    apply_spawn_effort_env(
         &mut cmd,
         &r,
         Some(goose()),
         &[],
         None,
         &BTreeMap::new(),
-        None,
         &BTreeMap::new(),
     );
     let child_env = run_env_cmd(&mut cmd);
-
-    std::env::remove_var(&lower);
 
     assert!(
         child_env.contains(&format!("{GOOSE_KEY}=high")),
@@ -938,14 +912,13 @@ fn production_sequence_arbitrary_mixedcase_collision_absent_from_child_windows()
     cmd.env(mixed, "stale-mixed");
     let mut r = record();
     r.effort_level = Some("high".into());
-    apply_effort_sequence_to_command(
+    apply_spawn_effort_env(
         &mut cmd,
         &r,
         Some(goose()),
         &[],
         None,
         &BTreeMap::new(),
-        None,
         &BTreeMap::new(),
     );
     let child_env = run_env_cmd(&mut cmd);
@@ -964,20 +937,22 @@ fn production_sequence_arbitrary_mixedcase_collision_absent_from_child_windows()
 }
 
 /// Custom passthrough: non-suppress-set effort keys survive the production sequence.
+/// Covers inherited `GOOSE_THINKING_EFFORT` on an unknown/custom runtime (not in the
+/// suppress set for unknown runtimes) and an unrelated key.
 #[test]
+#[cfg(not(target_os = "windows"))]
 fn production_sequence_custom_passthrough_survives() {
     let mut cmd = std::process::Command::new("/usr/bin/env");
     cmd.env_clear();
     cmd.env("MY_HARNESS_EFFORT", "high");
     cmd.env("MY_UNRELATED_CONFIG", "keep");
-    apply_effort_sequence_to_command(
+    apply_spawn_effort_env(
         &mut cmd,
         &record(),
         None,
         &[],
         None,
         &BTreeMap::new(),
-        None,
         &BTreeMap::new(),
     );
     let child_env = run_env_cmd(&mut cmd);
@@ -989,4 +964,79 @@ fn production_sequence_custom_passthrough_survives() {
         child_env.contains("MY_UNRELATED_CONFIG=keep"),
         "unrelated key must survive; env:\n{child_env}"
     );
+}
+
+/// Custom-runtime: inherited `GOOSE_THINKING_EFFORT` is outside the unknown-runtime
+/// suppress set and reaches the child. Contrast with the known-Goose case where it
+/// would be stripped. Uses the EnvVarGuard so panics cannot leak the seeded value.
+#[test]
+#[cfg(not(target_os = "windows"))]
+fn production_sequence_custom_inherited_goose_key_survives() {
+    let _lock = INHERITED_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = EnvVarGuard::set(GOOSE_KEY, "inherited-high");
+    let mut cmd = std::process::Command::new("/usr/bin/env");
+    apply_spawn_effort_env(
+        &mut cmd,
+        &record(),
+        None,
+        &[],
+        None,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    );
+    let child_env = run_env_cmd(&mut cmd);
+    assert!(
+        child_env.contains(&format!("{GOOSE_KEY}=inherited-high")),
+        "GOOSE key must survive for unknown runtime; env:\n{child_env}"
+    );
+}
+
+/// Custom-runtime: inherited ACP sentinel survives as pass-through (no column).
+#[test]
+#[cfg(not(target_os = "windows"))]
+fn production_sequence_custom_inherited_acp_sentinel_survives() {
+    let _lock = INHERITED_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = EnvVarGuard::set(ACP_KEY, "inherited-val");
+    let mut cmd = std::process::Command::new("/usr/bin/env");
+    apply_spawn_effort_env(
+        &mut cmd,
+        &record(),
+        None,
+        &[],
+        None,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    );
+    let child_env = run_env_cmd(&mut cmd);
+    assert!(
+        child_env.contains(&format!("{ACP_KEY}=inherited-val")),
+        "ACP sentinel must survive for unknown runtime with no column; env:\n{child_env}"
+    );
+}
+
+/// Windows: custom-wrapper effort keys survive the production sequence.
+#[test]
+#[cfg(target_os = "windows")]
+fn production_sequence_custom_passthrough_survives() {
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.args(["/c", "set"]);
+    cmd.env_clear();
+    cmd.env("MY_HARNESS_EFFORT", "high");
+    cmd.env("MY_UNRELATED_CONFIG", "keep");
+    apply_spawn_effort_env(
+        &mut cmd,
+        &record(),
+        None,
+        &[],
+        None,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    );
+    let child_env = run_env_cmd(&mut cmd);
+    assert!(child_env
+        .to_ascii_uppercase()
+        .contains("MY_HARNESS_EFFORT=HIGH"));
+    assert!(child_env
+        .to_ascii_uppercase()
+        .contains("MY_UNRELATED_CONFIG=KEEP"));
 }
