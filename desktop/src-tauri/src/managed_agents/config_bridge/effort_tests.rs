@@ -937,8 +937,6 @@ fn production_sequence_arbitrary_mixedcase_collision_absent_from_child_windows()
 }
 
 /// Custom passthrough: non-suppress-set effort keys survive the production sequence.
-/// Covers inherited `GOOSE_THINKING_EFFORT` on an unknown/custom runtime (not in the
-/// suppress set for unknown runtimes) and an unrelated key.
 #[test]
 #[cfg(not(target_os = "windows"))]
 fn production_sequence_custom_passthrough_survives() {
@@ -966,9 +964,8 @@ fn production_sequence_custom_passthrough_survives() {
     );
 }
 
-/// Custom-runtime: inherited `GOOSE_THINKING_EFFORT` is outside the unknown-runtime
-/// suppress set and reaches the child. Contrast with the known-Goose case where it
-/// would be stripped. Uses the EnvVarGuard so panics cannot leak the seeded value.
+/// Custom-runtime: inherited `GOOSE_THINKING_EFFORT` survives (unknown-runtime
+/// suppress set excludes foreign effort keys).
 #[test]
 #[cfg(not(target_os = "windows"))]
 fn production_sequence_custom_inherited_goose_key_survives() {

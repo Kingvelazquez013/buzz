@@ -37,7 +37,7 @@ use super::{
     readiness::EffectiveHarnessDescriptor,
     runtime::{resolve_session_title, SESSION_TITLE_ENV_VAR},
     types::{AgentDefinition, ManagedAgentRecord, TeamRecord},
-    GlobalAgentConfig,
+    AcpSessionPolicy, GlobalAgentConfig,
 };
 
 pub(crate) mod diff;
@@ -75,6 +75,12 @@ pub(crate) struct SpawnConfigInputs<'a> {
     /// Compile-time distribution capability projected at this runtime boundary.
     /// The stored record remains portable; only effective spawned access is stamped.
     pub enforced_owner_only: bool,
+    /// The effective ACP session policy (`channel`/`thread`) the launch applies.
+    /// Resolved from the desktop experiment toggle at the shared launch
+    /// boundary; captured here so flipping the experiment while an agent runs
+    /// drives the existing restart-required path (the harness only reads
+    /// `BUZZ_ACP_SESSION_POLICY` at launch).
+    pub session_policy: AcpSessionPolicy,
 }
 
 /// The effective spawn configuration of one managed-agent process.
@@ -138,6 +144,14 @@ pub(crate) struct SpawnConfigSnapshot {
     /// sentinel, so any other effort-looking key the child receives stays in
     /// `env` as ordinary state and diffs normally.
     pub effort_level: Option<String>,
+    /// The effective ACP session policy this launch applies (`channel` or
+    /// `thread`). The harness reads `BUZZ_ACP_SESSION_POLICY` only at launch, so
+    /// capturing the resolved policy here lets a toggle flip while an agent runs
+    /// raise the restart-required badge instead of silently leaving the running
+    /// process on the old policy. Written directly on the spawn `Command` (not
+    /// via layered env), so it must be captured explicitly rather than read back
+    /// out of `env`.
+    pub session_policy: String,
 }
 
 /// The startup effort a spawn actually applied, read from the single effort key
@@ -176,6 +190,7 @@ impl SpawnConfigSnapshot {
             model,
             provider,
             enforced_owner_only,
+            session_policy,
         } = inputs;
         let (respond_to, respond_to_allowlist) =
             super::projected_access_with_policy(record, enforced_owner_only);
@@ -242,6 +257,7 @@ impl SpawnConfigSnapshot {
             // resolver left in `descriptor.env`, so the badge compares exactly
             // what launched regardless of which tier supplied the value.
             effort_level: effective_effort(descriptor),
+            session_policy: session_policy.as_str().to_string(),
         }
     }
 
@@ -282,6 +298,7 @@ pub(crate) fn prospective_spawn_config_snapshot(
     workspace_relay: &str,
     global: &GlobalAgentConfig,
     enforced_owner_only: bool,
+    session_policy: AcpSessionPolicy,
 ) -> SpawnConfigSnapshot {
     // Prospective re-snapshot: apply the same `apply_persona_snapshot` the
     // start/restore paths run right before spawning, so this describes what a
@@ -332,6 +349,7 @@ pub(crate) fn prospective_spawn_config_snapshot(
         model: model.as_deref(),
         provider: provider.as_deref(),
         enforced_owner_only,
+        session_policy,
     })
 }
 
