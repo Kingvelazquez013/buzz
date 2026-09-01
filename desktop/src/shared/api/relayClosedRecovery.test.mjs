@@ -60,12 +60,10 @@ function resetAll(startMs = 0) {
   resetRateLimitGate();
 }
 
-test("production CLOSED handler rejects history once and clears its timeout", () => {
+test("production CLOSED handler rejects non-rate-limited history immediately and clears its timeout", () => {
   const originalWindow = globalThis.window;
   const clearedTimeouts = [];
   globalThis.window = {
-    // Provide both setTimeout (needed by activateRateLimit in the F1 fix) and
-    // clearTimeout (the existing assertion target).
     setTimeout: (_fn, _ms) => 0,
     clearTimeout: (timeout) => clearedTimeouts.push(timeout),
   };
@@ -76,10 +74,12 @@ test("production CLOSED handler rejects history once and clears its timeout", ()
         "history-1",
         {
           mode: "history",
+          filter: { kinds: [0], authors: ["pubkey-1"], limit: 10 },
           events: [],
           resolve: () => assert.fail("CLOSED must not resolve history"),
           reject: (error) => errors.push(error),
           timeout: 42,
+          timeoutMs: 25_000,
         },
       ],
     ]);
@@ -88,21 +88,122 @@ test("production CLOSED handler rejects history once and clears its timeout", ()
       subId: "history-1",
       sendReq: () => Promise.resolve(),
     };
-    handleRelayClosed({
-      ...input,
-      message: "rate-limited: too many concurrent requests",
-    });
+    // Non-rate-limited CLOSED should reject immediately.
+    handleRelayClosed({ ...input, message: "error: database unavailable" });
     handleRelayClosed({ ...input, message: "late CLOSED" });
     assert.equal(subscriptions.has("history-1"), false);
     assert.deepEqual(clearedTimeouts, [42]);
     assert.equal(errors.length, 1);
-    assert.equal(
-      errors[0].message,
-      "rate-limited: too many concurrent requests",
-    );
+    assert.equal(errors[0].message, "error: database unavailable");
   } finally {
     globalThis.window = originalWindow;
   }
+});
+
+test("rate-limited history CLOSED schedules retry instead of rejecting immediately", () => {
+  resetAll(0);
+  const errors = [];
+  const reqsSent = [];
+  const subscriptions = new Map([
+    [
+      "history-rl",
+      {
+        mode: "history",
+        filter: { kinds: [0], authors: ["pubkey-1"], limit: 10 },
+        events: [],
+        resolve: () => assert.fail("must not resolve before retry"),
+        reject: (error) => errors.push(error),
+        timeout: 99,
+        timeoutMs: 25_000,
+      },
+    ],
+  ]);
+  handleRelayClosed({
+    subscriptions,
+    subId: "history-rl",
+    message: "rate-limited: quota exceeded; retry in 5s",
+    sendReq: (id, filter) => {
+      reqsSent.push({ id, filter });
+      return Promise.resolve();
+    },
+  });
+  // Subscription should NOT have been rejected immediately.
+  assert.equal(
+    errors.length,
+    0,
+    "must not reject immediately on first attempt",
+  );
+  // Original subId evicted, a new one registered.
+  assert.equal(subscriptions.has("history-rl"), false);
+  // No retry fired yet at t=0.
+  assert.equal(reqsSent.length, 0, "retry must not fire before delay");
+  // Fire the retry timer (hint=5s → delayMs=5000).
+  tickTo(5_001);
+  assert.equal(
+    reqsSent.length,
+    1,
+    "retry REQ must fire after rate-limit window",
+  );
+});
+
+test("rate-limited history CLOSED exhausts 3 retries then rejects permanently", () => {
+  resetAll(0);
+  const errors = [];
+  const reqsSent = [];
+  const filter = { kinds: [0], authors: ["pk"], limit: 1 };
+  const subscription = {
+    mode: "history",
+    filter,
+    events: [],
+    resolve: () => assert.fail("must not resolve"),
+    reject: (error) => errors.push(error),
+    timeout: 0,
+    timeoutMs: 25_000,
+  };
+  const subscriptions = new Map([["history-rl", subscription]]);
+  const sendReq = (id, _filter) => {
+    reqsSent.push(id);
+    return Promise.resolve();
+  };
+
+  // Simulate 3 rate-limited CLOSEDs (exhausts the attempt budget).
+  for (let i = 0; i < 3; i++) {
+    // The current live subId rotates on each retry; find it.
+    const currentSubId = [...subscriptions.keys()].find((k) =>
+      k.startsWith("history"),
+    );
+    assert.ok(currentSubId, `must have a live history sub on attempt ${i}`);
+    handleRelayClosed({
+      subscriptions,
+      subId: currentSubId,
+      message: "rate-limited: quota exceeded; retry in 1s",
+      sendReq,
+    });
+    assert.equal(
+      errors.length,
+      0,
+      `must not reject before attempt ${i + 1} fires`,
+    );
+    tickTo((i + 1) * 1_001);
+    assert.equal(reqsSent.length, i + 1, `sendReq call ${i + 1} must fire`);
+  }
+
+  // 4th CLOSED — attempt budget exhausted → permanent reject.
+  const currentSubId = [...subscriptions.keys()].find((k) =>
+    k.startsWith("history"),
+  );
+  assert.ok(
+    currentSubId,
+    "must still have a live history sub before last CLOSED",
+  );
+  handleRelayClosed({
+    subscriptions,
+    subId: currentSubId,
+    message: "rate-limited: quota exceeded; retry in 1s",
+    sendReq,
+  });
+  assert.equal(errors.length, 1, "must reject after 3 failed retries");
+  assert.equal(subscriptions.size, 0, "must evict sub after permanent reject");
 });
 
 test("rate-limited history CLOSED arms the shared gate for concurrent ops", () => {
@@ -112,10 +213,12 @@ test("rate-limited history CLOSED arms the shared gate for concurrent ops", () =
       "history-1",
       {
         mode: "history",
+        filter: { kinds: [0], authors: ["pubkey-1"], limit: 10 },
         events: [],
         resolve: () => {},
         reject: () => {},
         timeout: 0,
+        timeoutMs: 25_000,
       },
     ],
   ]);
@@ -142,10 +245,12 @@ test("non-rate-limited history CLOSED does not arm the gate", () => {
       "history-2",
       {
         mode: "history",
+        filter: { kinds: [9], "#h": ["ch-1"], limit: 50 },
         events: [],
         resolve: () => {},
         reject: () => {},
         timeout: 0,
+        timeoutMs: 25_000,
       },
     ],
   ]);
@@ -173,10 +278,12 @@ test("gate armed by rate-limited history CLOSED defers the next REQ until expiry
       "history-gate",
       {
         mode: "history",
+        filter: { kinds: [9], "#h": ["ch-gate"], limit: 50 },
         events: [],
         resolve: () => {},
         reject: () => {},
         timeout: 0,
+        timeoutMs: 25_000,
       },
     ],
   ]);

@@ -37,14 +37,57 @@ export function handleRelayClosed({
   const subscription = subscriptions.get(subId);
   if (!subscription) return;
   if (subscription.mode !== "live") {
-    // Classify before rejecting so a `rate-limited:` history CLOSED arms the
-    // gate for concurrent ops. A history sub can't be retried (the caller holds
-    // the promise), so we still reject immediately after arming.
+    // Classify before acting so a `rate-limited:` CLOSED arms the gate for
+    // concurrent ops regardless of whether this specific sub can be retried.
     const closedClass = classifyRelayClosed(message);
     if (closedClass === "rate-limited") {
       const hintSeconds = parseRateLimitHint(message);
       activateRateLimit(hintSeconds);
+
+      // History subs hold a promise the caller is awaiting. Rather than
+      // rejecting immediately, defer and re-issue the REQ after the
+      // rate-limit window so the caller transparently receives their result.
+      // Bounded to 3 attempts — if the relay keeps refusing, fall through
+      // to the permanent reject so the caller's promise resolves with an error
+      // rather than waiting forever.
+      if (subscription.mode === "history") {
+        const attempt = subscription.closedRetryAttempt ?? 0;
+        if (attempt < 3) {
+          subscription.closedRetryAttempt = attempt + 1;
+          // Clear the existing op-timeout so it doesn't fire while waiting for
+          // the rate-limit window. The setTimeout delay covers this interval.
+          window.clearTimeout(subscription.timeout);
+          const hintMs = (hintSeconds ?? 10) * 1_000;
+          const delayMs = Math.max(rateLimitRemainingMs() || hintMs, hintMs);
+          // Re-register under a new id so the old subId can be evicted cleanly.
+          // Accumulated events are preserved on the subscription object.
+          const newSubId = `history-${crypto.randomUUID()}`;
+          subscriptions.delete(subId);
+          subscriptions.set(newSubId, subscription);
+          // Use the rate-limit delay as the new timeout budget so the
+          // subscription is not left open indefinitely while waiting.
+          subscription.timeout = window.setTimeout(() => {
+            if (!subscriptions.has(newSubId)) return; // cancelled while waiting
+            void sendReq(newSubId, subscription.filter).catch(() => {
+              subscriptions.delete(newSubId);
+              subscription.reject(
+                new Error(message || "Relay closed the history subscription."),
+              );
+            });
+            // Set a new op-timeout for the retry REQ so the subscription
+            // cannot hang indefinitely if the relay stops responding.
+            subscription.timeout = window.setTimeout(() => {
+              subscriptions.delete(newSubId);
+              subscription.reject(
+                new Error("Relay closed the history subscription."),
+              );
+            }, subscription.timeoutMs);
+          }, delayMs);
+          return;
+        }
+      }
     }
+
     window.clearTimeout(subscription.timeout);
     subscriptions.delete(subId);
     subscription.reject(
