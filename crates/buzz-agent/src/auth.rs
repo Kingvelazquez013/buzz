@@ -533,29 +533,6 @@ impl PkceOAuthTokenSource {
         Ok(())
     }
 
-    /// Neutralize a cached token the caller just reported 401-rejected.
-    ///
-    /// A 401 means the cached access token is dead even though its local expiry
-    /// clock still looks fresh. [`cached_hit`](Self::cached_hit) and
-    /// [`usable_from_disk`](Self::usable_from_disk) already exclude it for a
-    /// caller carrying `rejected`, but a *later* plain `bearer()`
-    /// (`rejected = None`) trusts the clock and would serve it, and a freshly
-    /// constructed source would restore it from disk. Force it expired in both
-    /// layers so [`is_expired`] excludes it for every future caller and every
-    /// fresh process, while the refresh token — which was *not* rejected and
-    /// drives this very recovery — stays intact. Each layer is neutralized only
-    /// when its access token byte-equals `rejected`, so a sibling's
-    /// concurrently-written distinct replacement is preserved.
-    ///
-    /// Disk neutralization is a bounded three-stage process: on atomic-rewrite
-    /// failure (e.g. non-writable parent directory), the implementation falls
-    /// back to an in-place truncating overwrite of the existing file (no
-    /// parent-dir perms required), and finally to `remove_file`. If all three
-    /// fail the file survives; `cached_hit`'s `rejected`-aware filter protects
-    /// this caller's path, but a later plain `bearer()` could re-read the
-    /// unexpired file. That residual corner is outside the normal threat model
-    /// (owner actively hardening their own cache file to 0400 against their own
-    /// process).
     /// Neutralize the matching rejected credential in B's own in-memory `state`
     /// only — no disk I/O. The joiner matching-failure path calls this rather
     /// than `expire_rejected`: the leader already ran the durable disk
@@ -587,6 +564,29 @@ impl PkceOAuthTokenSource {
         }
     }
 
+    /// Neutralize a cached token the caller just reported 401-rejected.
+    ///
+    /// A 401 means the cached access token is dead even though its local expiry
+    /// clock still looks fresh. [`cached_hit`](Self::cached_hit) and
+    /// [`usable_from_disk`](Self::usable_from_disk) already exclude it for a
+    /// caller carrying `rejected`, but a *later* plain `bearer()`
+    /// (`rejected = None`) trusts the clock and would serve it, and a freshly
+    /// constructed source would restore it from disk. Force it expired in both
+    /// layers so [`is_expired`] excludes it for every future caller and every
+    /// fresh process, while the refresh token — which was *not* rejected and
+    /// drives this very recovery — stays intact. Each layer is neutralized only
+    /// when its access token byte-equals `rejected`, so a sibling's
+    /// concurrently-written distinct replacement is preserved.
+    ///
+    /// Disk neutralization is a bounded three-stage process: on atomic-rewrite
+    /// failure (e.g. non-writable parent directory), the implementation falls
+    /// back to an in-place truncating overwrite of the existing file (no
+    /// parent-dir perms required), and finally to `remove_file`. If all three
+    /// fail the file survives; `cached_hit`'s `rejected`-aware filter protects
+    /// this caller's path, but a later plain `bearer()` could re-read the
+    /// unexpired file. That residual corner is outside the normal threat model
+    /// (owner actively hardening their own cache file to 0400 against their own
+    /// process).
     fn expire_rejected(&self, state: &mut Option<CachedToken>, rejected: Option<&str>) {
         let Some(rej) = rejected else { return };
         // Neutralize the in-memory entry: force-expire so `is_expired` excludes
@@ -3228,8 +3228,8 @@ mod tests {
             "B must park at slot.wait() on the first poll"
         );
 
-        // B is now suspended in slot.wait(). Write Z into B's state — this is a
-        // real concurrent write that B will observe when it evaluates the
+        // B is now suspended in slot.wait(). Write Z into B's state — this is an
+        // intervening write that B will observe when it evaluates the
         // reconciliation predicate after waking.
         {
             let mut state = b.state.lock().await;
