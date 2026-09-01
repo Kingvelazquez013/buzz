@@ -61,11 +61,9 @@ let ChannelNavigationProvider;
 let CommunitiesProvider;
 let ChannelCanvas;
 
-// Tracks how many get_canvas calls have been made. Tests flip
-// `failRefetches` after the initial load succeeds so that the
-// settlement-triggered invalidation refetch fails.
-let getCanvasCallCount = 0;
-let getCanvasHistoryCallCount = 0;
+// `failRefetches` is flipped to true before a mutation fires so that the
+// settlement-triggered invalidation refetch fails, exercising the error+data
+// state that the components must handle non-destructively.
 let failRefetches = false;
 let nextSetCanvasVerified = false;
 
@@ -92,7 +90,6 @@ before(async () => {
   dom.window.__TAURI_INTERNALS__ = {
     invoke: async (cmd) => {
       if (cmd === "get_canvas") {
-        getCanvasCallCount++;
         if (failRefetches) {
           throw new Error("relay unavailable");
         }
@@ -106,7 +103,6 @@ before(async () => {
         };
       }
       if (cmd === "get_canvas_history") {
-        getCanvasHistoryCallCount++;
         if (failRefetches) {
           throw new Error("relay unavailable");
         }
@@ -202,7 +198,6 @@ async function mountCanvas(queryClient) {
 test("save: verified:false + refetch failure keeps canvas and save notice mounted", async () => {
   failRefetches = false;
   nextSetCanvasVerified = false;
-  getCanvasCallCount = 0;
 
   const queryClient = makeClient();
   const { container, root } = await mountCanvas(queryClient);
@@ -260,7 +255,6 @@ test("save: verified:false + refetch failure keeps canvas and save notice mounte
 test("save: successful refetch after recovery clears the refresh warning", async () => {
   failRefetches = false;
   nextSetCanvasVerified = false;
-  getCanvasCallCount = 0;
 
   const queryClient = makeClient();
   const { container, root } = await mountCanvas(queryClient);
@@ -311,8 +305,6 @@ test("save: successful refetch after recovery clears the refresh warning", async
 test("restore: verified:false + refetch failure keeps history panel, restore notice, and rows mounted", async () => {
   failRefetches = false;
   nextSetCanvasVerified = false;
-  getCanvasCallCount = 0;
-  getCanvasHistoryCallCount = 0;
 
   const queryClient = makeClient();
   const { container, root } = await mountCanvas(queryClient);
@@ -415,7 +407,6 @@ test("canvas: initial load failure with no data renders full error state", async
   // Start with refetches failing so the very first load fails.
   failRefetches = true;
   nextSetCanvasVerified = false;
-  getCanvasCallCount = 0;
 
   const queryClient = makeClient();
   const container = dom.window.document.createElement("div");
