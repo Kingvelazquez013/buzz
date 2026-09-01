@@ -1133,6 +1133,56 @@ test("a root agent mention is explicit for one message and never becomes retaine
     .toEqual([]);
 });
 
+test("a removed root-inherited agent stays excluded after the thread reopens", async ({
+  page,
+}) => {
+  await keepMentionedAgentsPinned(page);
+  await installAudienceFixtures(page);
+  await openGeneral(page);
+
+  const rootId = "c".repeat(64);
+  await page.evaluate(
+    ({ agentPubkey, eventId }) => {
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+        channelName: "general",
+        content: "@Morgarita root request",
+        id: eventId,
+        mentionPubkeys: [agentPubkey],
+      });
+    },
+    { agentPubkey: AGENT_A, eventId: rootId },
+  );
+  await openThread(page, rootId);
+
+  let composer = threadComposer(page);
+  await expect(
+    composer.getByTestId(`composer-address-lock-${AGENT_A}`),
+  ).toBeVisible();
+  await expect(composer.getByTestId("message-input")).toHaveText("@Morgarita ");
+  await composer.getByTestId(`composer-address-lock-remove-${AGENT_A}`).click();
+  await expect(composer.getByTestId("message-input")).toHaveText("");
+
+  await page.goto(`/#/channels/${RANDOM_CHANNEL_ID}`, {
+    waitUntil: "domcontentloaded",
+  });
+  await expect(page.getByTestId("chat-title")).toHaveText("random");
+  await openThread(page, rootId);
+
+  composer = threadComposer(page);
+  const input = composer.getByTestId("message-input");
+  await expect(
+    composer.getByTestId(`composer-address-lock-${AGENT_A}`),
+  ).toHaveCount(0);
+  await expect(input).toHaveText("");
+
+  const reply = "plain reply after reopening";
+  await input.fill(reply);
+  await input.press("Enter");
+  await expect
+    .poll(() => readOutgoingMentionPubkeys(page, reply))
+    .not.toContain(AGENT_A);
+});
+
 test("an unchecked agent remains excluded while automatic mentions stay enabled", async ({
   page,
 }) => {

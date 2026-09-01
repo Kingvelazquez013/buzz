@@ -110,7 +110,13 @@ test("mention control expands with automatically mentioned agents", async () => 
       /scale\(0.8\)/,
     );
   }
-  const remove = view.getByTestId("composer-address-lock-remove-agent-pubkey");
+  const remove = view.getByRole("button", {
+    name: "Don't automatically mention Agent Ada in this thread",
+  });
+  assert.equal(
+    remove.getAttribute("aria-label")?.includes("conversation"),
+    false,
+  );
   const removeChrome = remove.querySelector("span.absolute");
   assert.match(
     removeChrome?.className ?? "",
