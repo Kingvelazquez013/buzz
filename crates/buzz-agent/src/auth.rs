@@ -2406,7 +2406,7 @@ mod tests {
 
         let mut b_fut = pin!(source.acquire(AuthIntent::Headless, Some("rejected-bytes")));
         let waker = Waker::noop();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(waker);
 
         // Poll 1: B falls through fast-path (try_lock fails), joins the
         // pre-published slot, enters the Err match arm, and blocks on
@@ -2513,7 +2513,7 @@ mod tests {
 
         let mut b_fut = pin!(b.acquire(AuthIntent::Headless, Some("rejected-X")));
         let waker = Waker::noop();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(waker);
 
         // Poll 1: B falls through fast-path, joins the pre-published slot,
         // wakes to Err, and parks at state.lock().await.
@@ -3111,7 +3111,7 @@ mod tests {
         // Pin B's acquire() future in this stack frame for manual polling.
         let mut b_fut = pin!(b.acquire(AuthIntent::Headless, Some("token-X")));
         let waker = Waker::noop();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(waker);
 
         // Poll 1: B has no async suspension before `slot.wait()`'s inner
         // `rx.changed().await`. The slot is unpublished, so `changed()` parks.
@@ -3222,7 +3222,7 @@ mod tests {
         // first poll is the structural proof that B is parked there.
         let mut b_fut = pin!(b.acquire(AuthIntent::Headless, Some("token-X")));
         let waker = Waker::noop();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(waker);
         assert!(
             matches!(b_fut.as_mut().poll(&mut cx), Poll::Pending),
             "B must park at slot.wait() on the first poll"
