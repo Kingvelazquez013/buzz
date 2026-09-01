@@ -556,7 +556,6 @@ impl PkceOAuthTokenSource {
     /// unexpired file. That residual corner is outside the normal threat model
     /// (owner actively hardening their own cache file to 0400 against their own
     /// process).
-
     /// Neutralize the matching rejected credential in B's own in-memory `state`
     /// only — no disk I/O. The joiner matching-failure path calls this rather
     /// than `expire_rejected`: the leader already ran the durable disk
