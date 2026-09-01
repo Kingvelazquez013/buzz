@@ -2162,7 +2162,7 @@ mod tests {
 //   pg_poa_update_zero_rows    — POA UPDATE matches no rows → Transient
 //   pg_lifecycle_revision_advance — lifecycle_revision advances → BindingRetired
 #[cfg(test)]
-mod pg_integration {
+mod postgres_tests {
     use super::*;
     use buzz_auth::nip_fi::{
         AdmissionError, BindingProvenance, OperationIntent, ProofTransport, ProtectedObjectKind,
@@ -2992,8 +2992,8 @@ mod pg_integration {
 //
 // Run: DATABASE_URL=postgres://... cargo test -p buzz-relay -- --ignored orchestrator_pg
 #[cfg(test)]
-mod pg_orchestrator_integration {
-    use super::pg_integration::{setup_fixture, teardown_fixture};
+mod orchestrator_postgres_tests {
+    use super::postgres_tests::{setup_fixture, teardown_fixture};
     use super::*;
     use crate::nip_fi::NipFiVerify;
     use buzz_auth::nip_fi::{AdmissionError, BindingProvenance, ProofTransport, RouteCapability};
