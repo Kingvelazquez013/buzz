@@ -634,11 +634,9 @@ fn resolve_identity_with_store(
     })
 }
 
-/// Recover from a corrupt nsec in the keyring (parse failed). Prefer a valid
-/// leftover `identity.key` first. Only clear the keyring entry once a
-/// replacement exists, or when there was never a prior identity (no migration
-/// marker). If the marker is present but no valid file exists, return `Lost`
-/// and leave the corrupt keyring value in place for support / manual export.
+/// Recover from an unparseable keyring nsec, preferring a valid `identity.key`.
+/// If a migration marker exists without a valid file, retain the keyring value
+/// and return `Lost`. Without a marker, preserve the existing generate-fresh policy.
 fn recover_from_keyring(
     store: &impl IdentityKeyStore,
     legacy_path: &std::path::Path,
@@ -648,9 +646,8 @@ fn recover_from_keyring(
     eprintln!(
         "buzz-desktop: corrupt nsec in keyring ({error}), looking for a recovery path before clearing"
     );
-    // Never delete the keyring entry until a replacement exists. Steady-state
-    // installs are marker-only: clearing first would destroy the only copy of
-    // the identity even when the parse failure is transient or tool-side.
+    // Marker-only installs have no file fallback. Keep unreadable keyring
+    // material until a replacement exists rather than destroying the only copy.
     if legacy_path.exists() {
         if let Some(keys) = migrate_identity_file(store, legacy_path, data_dir)? {
             return Ok(ResolvedIdentity {
@@ -677,8 +674,7 @@ fn recover_from_keyring(
             storage: IdentityStorage::Ephemeral,
         });
     }
-    // No marker: genuine first launch with a corrupt keyring. Safe to clear and
-    // generate fresh — there was never a durable identity to protect.
+    // No marker: preserve the existing clear-and-generate first-launch policy.
     if let Err(e) = store.delete(IDENTITY_KEY_NAME) {
         eprintln!("buzz-desktop: failed to clear corrupt keyring value: {e}");
     }
@@ -690,6 +686,8 @@ fn recover_from_keyring(
     })
 }
 
+/// Load the `0o600` identity file, quarantining corruption, else generate and
+/// save a fresh key to the file. Used when no keyring is available.
 fn load_file_or_generate(
     legacy_path: &std::path::Path,
     data_dir: &std::path::Path,

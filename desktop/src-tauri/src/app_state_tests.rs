@@ -326,8 +326,8 @@ fn corrupt_keyring_recovers_valid_file_without_rotating() {
     // nsec (Present) AND a valid `identity.key` is on disk (leftover from a
     // failed prior migration), recovery must RECOVER THE FILE'S identity —
     // not quarantine the file and rotate to a fresh key (the original
-    // hazard). The corrupt keyring value must be cleared and replaced by the
-    // file's key (migrated in).
+    // hazard). Recovery must overwrite the corrupt keyring value with the
+    // file's key without deleting the keyring entry first.
     let dir = tempfile::tempdir().unwrap();
     let legacy_path = dir.path().join("identity.key");
     let file_keys = Keys::generate();
@@ -338,8 +338,8 @@ fn corrupt_keyring_recovers_valid_file_without_rotating() {
 
     // The FILE's identity is recovered — NOT a freshly generated one.
     assert_key_eq(&file_keys, &resolved.keys);
-    // The corrupt keyring value was cleared.
-    assert_eq!(store.deleted.borrow().as_slice(), [IDENTITY_KEY_NAME]);
+    // Recovery overwrites the corrupt value without deleting first.
+    assert!(store.deleted.borrow().is_empty());
     // The keyring now holds the file's key (migrated in, read-back verified).
     let file_nsec = file_keys.secret_key().to_bech32().unwrap();
     assert_eq!(
@@ -1376,7 +1376,10 @@ fn corrupt_keyring_marker_present_no_file_is_lost() {
 
     assert_eq!(resolved.recovery, RecoveryState::Lost);
     // Lost must keep the corrupt keyring entry for support/export.
-    assert!(!store.deleted.borrow().contains(&IDENTITY_KEY_NAME.to_string()));
+    assert!(!store
+        .deleted
+        .borrow()
+        .contains(&IDENTITY_KEY_NAME.to_string()));
     assert!(store.slot.borrow().contains_key(IDENTITY_KEY_NAME));
     assert!(!legacy_path.exists());
 }
@@ -1392,6 +1395,7 @@ fn corrupt_keyring_with_valid_file_recovers_before_delete() {
     let resolved = resolve_identity_with_store(&store, &legacy_path, dir.path()).unwrap();
     assert_eq!(resolved.recovery, RecoveryState::None);
     assert_key_eq(&file_keys, &resolved.keys);
+    assert!(store.deleted.borrow().is_empty());
 }
 
 #[test]
