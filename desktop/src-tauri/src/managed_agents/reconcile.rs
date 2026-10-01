@@ -92,13 +92,14 @@ fn reconcile_agents_in_dir_at(
         let content = std::fs::read_to_string(store_path)
             .map_err(|e| format!("failed to read {}: {e}", store_path.display()))?;
 
-        let shard_records: Vec<ManagedAgentRecord> = serde_json::from_str(&content).map_err(|e| {
-            super::storage::backup_invalid_store(store_path);
-            format!(
-                "failed to parse {} (preserved as .invalid): {e}",
-                store_path.display()
-            )
-        })?;
+        let shard_records: Vec<ManagedAgentRecord> =
+            serde_json::from_str(&content).map_err(|e| {
+                super::storage::backup_invalid_store(store_path);
+                format!(
+                    "failed to parse {} (preserved as .invalid): {e}",
+                    store_path.display()
+                )
+            })?;
         records.extend(shard_records);
     }
 

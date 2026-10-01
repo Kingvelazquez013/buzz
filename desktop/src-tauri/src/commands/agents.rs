@@ -8,9 +8,9 @@ use crate::{
     managed_agents::{
         bestie_assignment::{recover_pending_assignment_cleanup, with_agent_assignments_cleared},
         build_managed_agent_summary, current_instance_id, ensure_persona_is_active,
-        find_managed_agent_mut, load_managed_agents, load_managed_agents_for_active_community,
-        load_personas, load_teams, managed_agents_base_dir, normalize_agent_args,
-        resolve_provider_binary, save_managed_agents, start_managed_agent_process,
+        find_managed_agent_mut, load_managed_agents, load_personas, load_teams,
+        managed_agents_base_dir, normalize_agent_args, resolve_provider_binary,
+        retain_active_community, save_managed_agents, start_managed_agent_process,
         stop_managed_agent_process, stop_managed_agent_workspace_pair,
         sync_managed_agent_processes, try_regenerate_nest, validate_provider_config, BackendKind,
         CreateManagedAgentRequest, CreateManagedAgentResponse, ManagedAgentRecord,
@@ -299,7 +299,11 @@ pub async fn list_managed_agents(app: AppHandle) -> Result<Vec<ManagedAgentSumma
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
-        let mut records = load_managed_agents_for_active_community(&app)?;
+        // Sync and save the FULL roster: a save rewrites every community's
+        // store file and clears the ones left without records, so saving a
+        // community-filtered list here would wipe the other communities.
+        // Visibility (#7184) is applied to the summaries only, below.
+        let mut records = load_managed_agents(&app)?;
         let mut runtimes = state
             .managed_agent_processes
             .lock()
@@ -313,6 +317,8 @@ pub async fn list_managed_agents(app: AppHandle) -> Result<Vec<ManagedAgentSumma
         for pubkey in &exited_pubkeys {
             state.clear_agent_session_caches(pubkey);
         }
+
+        retain_active_community(&app, &mut records);
 
         let personas = load_personas(&app).unwrap_or_default();
         // One disk read for the whole list — build_managed_agent_summary takes
@@ -422,8 +428,7 @@ pub async fn create_managed_agent(
         // spawn path still ignores the pin (#2122 agents-everywhere), so this
         // only scopes roster visibility/storage — never where an agent may
         // run.
-        let active_workspace_relay =
-            relay_ws_url_with_override(&app.state::<AppState>());
+        let active_workspace_relay = relay_ws_url_with_override(&app.state::<AppState>());
         let resolved_relay_url = {
             let supplied = input
                 .relay_url
